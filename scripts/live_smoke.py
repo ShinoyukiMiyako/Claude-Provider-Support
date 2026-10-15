@@ -1,9 +1,10 @@
 """用真实 Claude API 冒烟：参数组合被接受、同前缀第二次请求命中缓存、工具调用不回放思考也能续接。
 
-只走插件的 handle_llm_request，不依赖 MaiBot。共发 4 次小请求，用 Opus 5.5 时总花费约 0.1 美元以内。
+只走插件的 handle_llm_request，不依赖 MaiBot。共发 4 次小请求，用 Opus 5.5 时总花费约 0.1 美元以内，Haiku 5.5 更低。
 
     $env:ANTHROPIC_API_KEY = "<你的 Key>"
-    uv run python scripts/live_smoke.py --model claude-opus-5-5
+    $env:ANTHROPIC_WORKSPACE_ID = "wrkspc_..."   # 仅当 Key 未限定到单个工作区时需要
+    uv run python scripts/live_smoke.py --model claude-haiku-5-5
 """
 
 from __future__ import annotations
@@ -87,7 +88,12 @@ async def run(model: str) -> int:
         "base_url": "https://api.anthropic.com",
         "api_key": os.environ["ANTHROPIC_API_KEY"],
         "auth_type": "bearer",
-        "default_headers": {},
+        # 未限定工作区的个人/服务账号 Key 必须带这个头，否则 API 返回 400
+        "default_headers": (
+            {"anthropic-workspace-id": os.environ["ANTHROPIC_WORKSPACE_ID"]}
+            if os.environ.get("ANTHROPIC_WORKSPACE_ID")
+            else {}
+        ),
         "default_query": {},
         "timeout": 180,
     }
@@ -155,7 +161,7 @@ async def run(model: str) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="claude-opus-5-5")
+    parser.add_argument("--model", default="claude-haiku-5-5")
     args = parser.parse_args()
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise SystemExit("未设置 ANTHROPIC_API_KEY 环境变量")

@@ -60,6 +60,12 @@ model_list = ["claude-opus-5-5"]
 
 - **`send_temperature = false`**：Claude Opus 4.7 及之后的模型收到任何 `temperature` 都返回 400，Sonnet 5.5 / Haiku 5.5 只接受默认值。MaiBot 任务默认温度是 0.7，不关掉就会每次请求都失败。插件不会替你吞掉这个参数：开着就原样发给 API。
 - **`auth_type` 保持默认值 `bearer`**：插件固定通过 `x-api-key` 头鉴权，其他取值会直接报错。
+- **workspace ID**：只有 Key 没有限定到单个工作区时才需要（个人 Key 或服务账号 Key 创建时选了多个工作区），缺了 API 会返回 400。ID 在 Console 的 Workspaces 页 ID 列，格式为 `wrkspc_...`，加在 Provider 下：
+
+  ```toml
+  [api_providers.default_headers]
+  anthropic-workspace-id = "wrkspc_..."
+  ```
 - **`max_tokens`**：MaiBot 任务默认只有 4096。思考 token 也计入这个上限，耗尽时插件会报错并提示调大，正文被截断时只记警告并返回已生成的部分。
 - **价格**：MaiBot 按"元 / M token"统计。Opus 5.5 官方价为输入 $4、输出 $20、缓存读取 $0.20（每百万 token），请按汇率换算后填入 `price_in` / `price_out` / `cache_price_in`。缓存写入的 1.25 倍（5m）/ 2 倍（1h）溢价在 MaiBot 统计里体现不出来。
 
@@ -114,5 +120,5 @@ MAIBOT_ROOT=/path/to/MaiBot /path/to/MaiBot/.venv/bin/python -m pytest tests
 真实 API 冒烟测试共发 4 次小请求，验证参数组合被接受、缓存命中和工具调用续接：
 
 ```bash
-ANTHROPIC_API_KEY=<你的 Key> uv run python scripts/live_smoke.py --model claude-opus-5-5
+ANTHROPIC_API_KEY=<你的 Key> ANTHROPIC_WORKSPACE_ID=<仅多工作区 Key 需要> uv run python scripts/live_smoke.py --model claude-haiku-5-5
 ```
