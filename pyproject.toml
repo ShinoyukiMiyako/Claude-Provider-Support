@@ -1,0 +1,30 @@
+[project]
+name = "maibot-claude-provider"
+version = "0.1.0"
+description = "MaiBot LLM Provider plugin for the official Claude Messages API"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=1.14.0,<2.0.0",
+    "maibot-plugin-sdk>=2.12.0,<3.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.2",
+    "ruff>=0.14",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
