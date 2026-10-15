@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Mapping
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -18,6 +19,8 @@ from .claude_adapter import (
 from .config_models import ClaudeProviderConfig, ProviderSettings
 
 PLUGIN_VERSION = "0.1.0"
+WORKSPACE_HEADER = "anthropic-workspace-id"
+_WORKSPACE_ID = re.compile(r"wrkspc_\S+")
 
 
 class ClaudeProviderPlugin(MaiBotPlugin):
@@ -92,7 +95,7 @@ class ClaudeProviderPlugin(MaiBotPlugin):
         if not isinstance(api_key, str) or not api_key:
             raise ClaudeProviderError("api_provider.api_key 为空，请在模型配置的 Provider 里填写 Claude API Key")
         base_url = _validate_base_url(provider.get("base_url"))
-        headers = dict(provider.get("default_headers") or {})
+        headers = _validate_headers(provider.get("default_headers"))
         query = dict(provider.get("default_query") or {})
         timeout = float(provider["timeout"])
 
@@ -129,6 +132,19 @@ def _validate_base_url(raw_base_url: Any) -> str:
         # SDK 会自己拼上 /v1/messages，带着 /v1 会请求到 /v1/v1/messages
         raise ClaudeProviderError(f"api_provider.base_url 不要带 /v1，请改为 {base_url[: -len('/v1')]}")
     return base_url
+
+
+def _validate_headers(raw_headers: Any) -> dict[str, Any]:
+    headers = dict(raw_headers or {})
+    for name, value in headers.items():
+        # 未限定工作区的 Key（个人 Key、多工作区服务账号 Key）靠这个头选工作区；
+        # 复制时带进空格或填成工作区名称，API 只会回一个看不出原因的 400
+        if name.lower() == WORKSPACE_HEADER and not (isinstance(value, str) and _WORKSPACE_ID.fullmatch(value)):
+            raise ClaudeProviderError(
+                f"default_headers 中的 {name} 应为 Console Workspaces 页 ID 列的 wrkspc_... 值，"
+                f"不含空格和引号，实际为 {value!r}"
+            )
+    return headers
 
 
 def create_plugin() -> ClaudeProviderPlugin:

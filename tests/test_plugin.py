@@ -91,6 +91,8 @@ async def test_clients_are_reused_per_provider_and_closed_on_unload(plugin) -> N
         ({"base_url": ""}, "base_url 为空"),
         ({"auth_type": "header"}, "x-api-key"),
         ({"api_key": ""}, "api_key 为空"),
+        ({"default_headers": {"anthropic-workspace-id": " wrkspc_01ExampleWorkspaceId0000"}}, "wrkspc_"),
+        ({"default_headers": {"Anthropic-Workspace-Id": "Default"}}, "Anthropic-Workspace-Id"),
     ],
 )
 def test_invalid_provider_config_is_rejected(plugin, adapter, overrides, message) -> None:

@@ -121,3 +121,33 @@ async def test_real_sdk_wire_request_and_stream_parsing(plugin) -> None:
         "prompt_cache_miss_tokens": 30,
     }
     await client.close()
+
+
+async def test_workspace_header_from_provider_reaches_the_wire(plugin, plugin_module, monkeypatch) -> None:
+    # beta.messages.stream 自带 workspace_id 参数，未传时以 Omit 占位；要确认它不会冲掉 Provider 配的头
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["headers"] = dict(request.headers)
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=_sse_body())
+
+    real_client = plugin_module.AsyncAnthropic
+
+    def client_with_mock_transport(**kwargs: Any) -> AsyncAnthropic:
+        return real_client(**kwargs, http_client=DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)))
+
+    monkeypatch.setattr(plugin_module, "AsyncAnthropic", client_with_mock_transport)
+    request = make_request([text_item("UserMessageItem", "hi")])
+    request["api_provider"] = {
+        "base_url": "https://api.anthropic.com",
+        "api_key": "sk-ant-test-placeholder",
+        "auth_type": "bearer",
+        "default_headers": {"anthropic-workspace-id": "wrkspc_01ExampleWorkspaceId0000"},
+        "default_query": {},
+        "timeout": 30,
+    }
+
+    await plugin.handle_llm_request(operation="response", request=request)
+
+    assert captured["headers"]["anthropic-workspace-id"] == "wrkspc_01ExampleWorkspaceId0000"
+    await plugin.on_unload()

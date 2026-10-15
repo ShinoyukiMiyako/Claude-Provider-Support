@@ -66,6 +66,8 @@ model_list = ["claude-opus-5-5"]
   [api_providers.default_headers]
   anthropic-workspace-id = "wrkspc_..."
   ```
+
+  WebUI 的 Provider 编辑页里也可以直接加这个请求头。插件会校验它的值必须是 `wrkspc_` 开头、不含空格，格式不对时直接报错，不会把请求发出去换回一个看不出原因的 400。
 - **`max_tokens`**：MaiBot 任务默认只有 4096。思考 token 也计入这个上限，耗尽时插件会报错并提示调大，正文被截断时只记警告并返回已生成的部分。
 - **价格**：MaiBot 按"元 / M token"统计。Opus 5.5 官方价为输入 $4、输出 $20、缓存读取 $0.20（每百万 token），请按汇率换算后填入 `price_in` / `price_out` / `cache_price_in`。缓存写入的 1.25 倍（5m）/ 2 倍（1h）溢价在 MaiBot 统计里体现不出来。
 
