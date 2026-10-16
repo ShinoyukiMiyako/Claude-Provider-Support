@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 from support import make_request, meta, text_item
 
@@ -88,6 +90,126 @@ def test_mid_conversation_system_message_stays_in_place(adapter) -> None:
     assert messages[-1] == {"role": "system", "content": [{"type": "text", "text": "接下来简短回答"}]}
 
 
+def test_mid_conversation_system_before_assistant_stays_in_place(adapter) -> None:
+    _, messages = adapter.build_conversation(
+        [
+            text_item("UserMessageItem", "在吗"),
+            text_item("SystemMessageItem", "只用两个字回复"),
+            text_item("AssistantMessageItem", "在的"),
+            text_item("UserMessageItem", "今天怎么样"),
+        ]
+    )
+
+    assert [message["role"] for message in messages] == ["user", "system", "assistant", "user"]
+
+
+@pytest.mark.parametrize(
+    ("items", "expected_text"),
+    [
+        # 跟在 assistant 之后：API 要求中途 system 紧跟 user
+        (
+            [
+                text_item("UserMessageItem", "在吗"),
+                text_item("AssistantMessageItem", "在的"),
+                text_item("SystemMessageItem", "接下来简短回答"),
+                text_item("UserMessageItem", "今天怎么样"),
+            ],
+            "接下来简短回答\n今天怎么样",
+        ),
+        # 夹在两条 user 之间：API 要求中途 system 位于末尾或紧接 assistant
+        (
+            [
+                text_item("UserMessageItem", "在吗"),
+                text_item("SystemMessageItem", "接下来简短回答"),
+                text_item("UserMessageItem", "今天怎么样"),
+            ],
+            "在吗\n接下来简短回答\n今天怎么样",
+        ),
+    ],
+)
+def test_misplaced_mid_conversation_system_becomes_user_text(adapter, items, expected_text) -> None:
+    _, messages = adapter.build_conversation(items)
+
+    assert "system" not in [message["role"] for message in messages]
+    assert messages[-1] == {"role": "user", "content": [{"type": "text", "text": expected_text}]}
+
+
+def test_tool_result_is_moved_before_text_in_the_same_user_message(adapter) -> None:
+    call, result = _tool_round_items()[4], _tool_round_items()[6]
+    _, messages = adapter.build_conversation(
+        [text_item("UserMessageItem", "查一下"), call, text_item("UserMessageItem", "顺便看看"), result]
+    )
+
+    assert [block["type"] for block in messages[2]["content"]] == ["tool_result", "text"]
+    assert messages[2]["content"][0]["tool_use_id"] == "call_a"
+
+
+def test_demoted_system_does_not_push_tool_result_behind_text(adapter) -> None:
+    call, result = _tool_round_items()[4], _tool_round_items()[6]
+    _, messages = adapter.build_conversation(
+        [text_item("UserMessageItem", "查一下"), call, text_item("SystemMessageItem", "结果要简短"), result]
+    )
+
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    assert [block["type"] for block in messages[2]["content"]] == ["tool_result", "text"]
+    assert messages[2]["content"][1]["text"] == "结果要简短"
+
+
+def test_foreign_tool_call_ids_are_normalized_consistently(adapter) -> None:
+    def call(call_id: str) -> dict:
+        return {
+            "item_type": "FunctionCallItem",
+            "meta": meta("t1"),
+            "tool_call": {"call_id": call_id, "func_name": "search", "args": {}, "extra_content": None},
+        }
+
+    def output(call_id: str) -> dict:
+        return {
+            "item_type": "FunctionCallOutputItem",
+            "meta": meta("t1"),
+            "call_id": call_id,
+            "output": "ok",
+            "success": True,
+            "tool_name": "search",
+        }
+
+    question = text_item("UserMessageItem", "查")
+    _, messages = adapter.build_conversation(
+        [question, call("fc.1:a"), call("fc:1.a"), output("fc.1:a"), output("fc:1.a")]
+    )
+
+    tool_ids = [block["id"] for block in messages[1]["content"]]
+    result_ids = [block["tool_use_id"] for block in messages[2]["content"]]
+    assert tool_ids == result_ids
+    assert all(re.fullmatch(r"[A-Za-z0-9_-]+", tool_id) for tool_id in tool_ids)
+    # 只是分隔符不同的两个 id 不能被归一成同一个
+    assert tool_ids[0] != tool_ids[1]
+    _, again = adapter.build_conversation([question, call("fc.1:a"), output("fc.1:a")])
+    assert again[1]["content"][0]["id"] == tool_ids[0]
+
+
+def test_blank_text_is_dropped_instead_of_sent(adapter) -> None:
+    blank_reply = {"item_type": "AssistantMessageItem", "meta": meta(), "parts": [{"type": "text", "text": " \n"}]}
+    blank_user = {
+        "item_type": "UserMessageItem",
+        "meta": meta(),
+        "parts": [{"type": "image", "image_format": "png", "image_base64": "QUJD"}, {"type": "text", "text": "\n"}],
+    }
+
+    _, messages = adapter.build_conversation([text_item("UserMessageItem", "在吗"), blank_reply, blank_user])
+
+    # 只有空白的 assistant 消息整条去掉，前后两条 user 随之合并
+    assert messages == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "在吗"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+            ],
+        }
+    ]
+
+
 def test_empty_tool_output_omits_content(adapter) -> None:
     _, messages = adapter.build_conversation(
         [
@@ -151,7 +273,7 @@ def test_default_params_enable_cache_thinking_and_fallback(adapter, settings) ->
     assert params["system"] == [
         {"type": "text", "text": "你是麦麦", "cache_control": {"type": "ephemeral", "ttl": "5m"}}
     ]
-    assert params["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+    assert "cache_control" not in params
     assert params["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert params["fallbacks"] == "default"
     assert params["betas"] == ["server-side-fallback-2026-07-01"]
@@ -187,25 +309,26 @@ def test_history_breakpoint_lands_before_per_request_tail(adapter, settings) -> 
         "text": "好家伙",
         "cache_control": {"type": "ephemeral", "ttl": "5m"},
     }
-    # system + 历史 + 请求级自动断点，不超过 API 的 4 个上限
-    assert params["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+    # 末尾那段每轮都变，请求级自动断点打在那里只写不读，所以不发
+    assert "cache_control" not in params
 
 
 def test_history_breakpoint_uses_tool_result_when_it_is_the_latest_model_side_block(adapter, settings) -> None:
     params = adapter.build_message_params(make_request(_tool_round_items()), settings)
 
-    # 最后一块模型侧内容是 call_b 的结果，后面的“继续”留给请求级自动断点
+    # 最后一块模型侧内容是 call_b 的结果，后面的“继续”是本轮新内容，不打断点
     assert _block_breakpoints(params) == [(2, 1)]
     assert params["messages"][2]["content"][1]["tool_use_id"] == "call_b"
 
 
-def test_no_history_breakpoint_when_model_side_block_is_already_last(adapter, settings) -> None:
+def test_history_breakpoint_on_last_block_when_request_ends_with_model_side_block(adapter, settings) -> None:
+    # 工具循环中途的请求以工具结果收尾，整段请求下一步都会原样出现
     items = [*_tool_round_items()[:-1]]
 
     params = adapter.build_message_params(make_request(items), settings)
 
-    assert _block_breakpoints(params) == []
-    assert params["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+    assert _block_breakpoints(params) == [(2, 1)]
+    assert "cache_control" not in params
 
 
 def test_no_history_breakpoint_without_model_side_blocks(adapter, settings) -> None:
@@ -214,6 +337,7 @@ def test_no_history_breakpoint_without_model_side_blocks(adapter, settings) -> N
     params = adapter.build_message_params(make_request(items), settings)
 
     assert _block_breakpoints(params) == []
+    assert "cache_control" not in params
 
 
 def test_split_message_parts_are_joined_back_into_one_block(adapter) -> None:
@@ -288,8 +412,8 @@ def test_one_hour_ttl_applies_to_both_breakpoints(adapter, config_models) -> Non
 
     params = adapter.build_message_params(make_request(_tool_round_items()), settings)
 
-    assert params["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert params["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert params["messages"][2]["content"][1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
 @pytest.mark.parametrize("model", ["claude-haiku-5-5", "claude-opus-4-8", "claude-sonnet-4-6"])
@@ -301,6 +425,17 @@ def test_fallback_only_sent_to_supporting_models(adapter, settings, model) -> No
 
     assert "fallbacks" not in params
     assert "betas" not in params
+
+
+@pytest.mark.parametrize("model", ["claude-fable-5", "claude-fable-5-1", "claude-sonnet-5-5"])
+def test_fallback_sent_to_supporting_models(adapter, settings, model) -> None:
+    request = make_request([text_item("UserMessageItem", "hi")])
+    request["model_info"]["model_identifier"] = model
+
+    params = adapter.build_message_params(request, settings)
+
+    assert params["fallbacks"] == "default"
+    assert params["betas"] == ["server-side-fallback-2026-07-01"]
 
 
 def test_fallback_can_be_disabled(adapter, config_models) -> None:

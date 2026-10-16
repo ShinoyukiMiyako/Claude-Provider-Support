@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -19,7 +21,9 @@ ITEM_SCHEMA_VERSION = 1
 DEFAULT_MAX_TOKENS = 16000
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 # 只有这些模型在 Claude API 上接受 fallbacks="default"；对其他模型发送该参数会被拒绝或不起作用
-SERVER_FALLBACK_MODELS = frozenset({"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5"})
+SERVER_FALLBACK_MODELS = frozenset(
+    {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-sonnet-5-5"}
+)
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 THINKING_MODES = ("adaptive", "omit")
 THINKING_DISPLAYS = ("summarized", "omitted")
@@ -38,6 +42,12 @@ _IMAGE_MEDIA_TYPES = {
     "webp": "image/webp",
 }
 _NORMAL_STOP_REASONS = frozenset({"end_turn", "tool_use", "stop_sequence"})
+_TRUNCATION_ADVICE = {
+    "max_tokens": (" max_tokens 上限", "请调大该任务或模型的 max_tokens"),
+    "model_context_window_exceeded": ("模型的上下文窗口上限", "请缩短该任务的聊天历史或注入内容"),
+}
+_TOOL_ID = re.compile(r"[A-Za-z0-9_-]+")
+_TOOL_ID_INVALID_CHAR = re.compile(r"[^A-Za-z0-9_-]")
 
 
 class ClaudeProviderError(RuntimeError):
@@ -91,8 +101,9 @@ def build_message_params(request: Mapping[str, Any], settings: ProviderSettings)
     if output_config:
         params["output_config"] = output_config
     if cache_control is not None:
+        # 不用请求级自动断点：MaiBot 每轮末尾都拼着只属于这一轮的内容，自动断点落在那里只写不读，
+        # 白付 1.25 倍（1h 为 2 倍）的写入价
         _mark_shared_prefix_end(messages, cache_control)
-        params["cache_control"] = cache_control
     temperature = request.get("temperature")
     if temperature is not None:
         # anthropic 1.x 去掉了 temperature 形参；仍接受它的旧模型只能经 extra_body 传入
@@ -137,7 +148,7 @@ def build_conversation(raw_items: Any) -> tuple[list[dict[str, Any]], list[dict[
         if item_type == "SystemMessageItem":
             blocks = _system_blocks(item.get("parts"), where)
             if messages:
-                # 对话中途的 system 消息原位发送；不支持的模型会由 API 明确拒绝
+                # 对话中途的 system 消息先原位放置，位置不合法的由 _demote_misplaced_system 统一改写
                 _append_message(messages, "system", blocks)
             else:
                 system_blocks.extend(blocks)
@@ -148,11 +159,12 @@ def build_conversation(raw_items: Any) -> tuple[list[dict[str, Any]], list[dict[
         elif item_type == "FunctionCallItem":
             _append_message(messages, "assistant", [_tool_use_block(item.get("tool_call"), where)])
         elif item_type == "FunctionCallOutputItem":
-            _append_message(messages, "user", [_tool_result_block(item, where)])
+            _append_tool_result(messages, _tool_result_block(item, where))
         elif item_type in _SKIPPED_ITEM_TYPES:
             continue
         else:
             raise ClaudeProviderError(f"{where} 的 item_type 无法转换: {item_type!r}")
+    _demote_misplaced_system(messages)
     if not messages:
         raise ClaudeProviderError("请求里没有可发送的 user/assistant 消息")
     return system_blocks, messages
@@ -193,11 +205,11 @@ def parse_message(message: Any) -> dict[str, Any]:
     pending_text: list[str] = []
 
     def flush_text() -> None:
-        if pending_text:
-            output_items.append(
-                {"item_type": "AssistantMessageItem", "parts": [{"type": "text", "text": "".join(pending_text)}]}
-            )
-            pending_text.clear()
+        text = "".join(pending_text)
+        pending_text.clear()
+        # 纯空白正文交回 MaiBot 后会作为 assistant 历史再发出来，整条只有空白的消息会被 API 拒绝
+        if text.strip():
+            output_items.append({"item_type": "AssistantMessageItem", "parts": [{"type": "text", "text": text}]})
 
     for index, block in enumerate(blocks):
         superseded = index < boundary
@@ -233,15 +245,18 @@ def parse_message(message: Any) -> dict[str, Any]:
             raise ClaudeProviderError(f"响应中出现本插件未启用的内容块类型: {block.type}")
     flush_text()
 
-    if stop_reason == "max_tokens":
+    if stop_reason in _TRUNCATION_ADVICE:
+        # 截断的响应已计费，原样重试只会再付一次输入费用得到同样的结果；有正文就交回已生成的部分
+        limit, advice = _TRUNCATION_ADVICE[stop_reason]
         if any(item["item_type"] == "FunctionCallItem" for item in output_items):
-            raise ClaudeProviderError(
-                "输出在工具调用中途达到 max_tokens 上限，参数不完整，请调大该任务或模型的 max_tokens"
-            )
+            raise ClaudeProviderError(f"输出在工具调用中途达到{limit}，参数不完整，{advice}")
         if not any(item["item_type"] == "AssistantMessageItem" for item in output_items):
-            raise ClaudeProviderError("max_tokens 在产出正文前就被思考耗尽，请调大该任务或模型的 max_tokens")
+            raise ClaudeProviderError(f"产出正文前就达到{limit}，{advice}")
     elif stop_reason not in _NORMAL_STOP_REASONS:
         raise ClaudeProviderError(f"未处理的 stop_reason: {stop_reason!r}")
+    elif not output_items:
+        # 与 MaiBot 内置客户端的空响应处理一致：报错让 Host 按 max_retry 重试，而不是交回一个空回复
+        raise ClaudeProviderError(f"响应没有正文、工具调用或思考摘要（stop_reason={stop_reason}）")
 
     return {
         "item_schema_version": ITEM_SCHEMA_VERSION,
@@ -319,22 +334,16 @@ def _read_max_tokens(raw_value: Any) -> int:
 
 
 def _mark_shared_prefix_end(messages: list[dict[str, Any]], cache_control: Mapping[str, Any]) -> None:
-    # MaiBot 每轮都在末尾重新拼接时间、人物画像、回复方向等一次性内容，请求级自动断点落在这段之后，
-    # 下一轮末尾一换就再也读不到，只剩 system 能命中。最后一块模型产出（回复、工具调用或其结果）之前的
-    # 内容下一轮必然原样出现，在这里补一个断点，下一轮从自己的断点回看 20 个位置即可命中整段历史
-    last_message = len(messages) - 1
-    for message_index in range(last_message, -1, -1):
-        message = messages[message_index]
+    # MaiBot 每轮都在末尾重新拼接时间、人物画像、回复方向等一次性内容，断点落在这段之后下一轮就读不到。
+    # 最后一块模型产出（回复、工具调用或其结果）之前的内容下一轮必然原样出现，断点打在这里，
+    # 下一轮从自己的断点回看 20 个位置即可命中整段历史
+    for message in reversed(messages):
         content = message["content"]
         for block_index in range(len(content) - 1, -1, -1):
             block = content[block_index]
-            if message["role"] != "assistant" and block.get("type") != "tool_result":
-                continue
-            if message_index == last_message and block_index == len(content) - 1:
-                # 已是整个请求的最后一块，请求级自动断点就落在这里，再标一次会重复占用断点名额
+            if message["role"] == "assistant" or block.get("type") == "tool_result":
+                content[block_index] = {**block, "cache_control": dict(cache_control)}
                 return
-            content[block_index] = {**block, "cache_control": dict(cache_control)}
-            return
 
 
 def _append_user_blocks(messages: list[dict[str, Any]], blocks: list[dict[str, Any]]) -> None:
@@ -348,7 +357,46 @@ def _append_user_blocks(messages: list[dict[str, Any]], blocks: list[dict[str, A
     _append_message(messages, "user", blocks)
 
 
+def _append_tool_result(messages: list[dict[str, Any]], block: dict[str, Any]) -> None:
+    # API 只在紧接 tool_use 的 user 消息开头找 tool_result；第三方插件可能先给文字再给结果，
+    # 原样追加会排在文字后面而被判为没有对应结果
+    if messages and messages[-1]["role"] == "user":
+        content = messages[-1]["content"]
+        position = next((index for index, existing in enumerate(content) if existing["type"] != "tool_result"), None)
+        content.insert(len(content) if position is None else position, block)
+    else:
+        messages.append({"role": "user", "content": [block]})
+
+
+def _demote_misplaced_system(messages: list[dict[str, Any]]) -> None:
+    # API 只接受紧跟 user、且位于末尾或紧接 assistant 的中途 system，其他位置一律 400；
+    # 这些位置的 system 改作 user 文本，内容仍送达模型
+    placed: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        following = messages[index + 1]["role"] if index + 1 < len(messages) else None
+        if message["role"] == "system":
+            if placed and placed[-1]["role"] == "user" and following in (None, "assistant"):
+                placed.append(message)
+            else:
+                _merge_user_content(placed, message["content"])
+        elif message["role"] == "user" and placed and placed[-1]["role"] == "user":
+            _merge_user_content(placed, message["content"])
+        else:
+            placed.append(message)
+    messages[:] = placed
+
+
+def _merge_user_content(messages: list[dict[str, Any]], blocks: list[dict[str, Any]]) -> None:
+    for block in blocks:
+        if block["type"] == "tool_result":
+            _append_tool_result(messages, block)
+    _append_user_blocks(messages, [block for block in blocks if block["type"] != "tool_result"])
+
+
 def _append_message(messages: list[dict[str, Any]], role: str, blocks: list[dict[str, Any]]) -> None:
+    if not blocks:
+        # 片段全被滤掉（例如只有空白）时不产生空消息，content 为空的消息会被 API 拒绝
+        return
     # 连续同角色合并成一条，保证 tool_use 与 tool_result 各自落在相邻的单条消息里
     if messages and messages[-1]["role"] == role:
         messages[-1]["content"].extend(blocks)
@@ -380,7 +428,7 @@ def _user_blocks(raw_parts: Any, where: str) -> list[dict[str, Any]]:
             blocks.append(_image_block(part, where))
         else:
             raise ClaudeProviderError(f"{where} 的用户消息片段类型无法转换: {part_type!r}")
-    return blocks
+    return _drop_blank_text(blocks)
 
 
 def _assistant_blocks(raw_parts: Any, where: str) -> list[dict[str, Any]]:
@@ -393,7 +441,12 @@ def _assistant_blocks(raw_parts: Any, where: str) -> list[dict[str, Any]]:
             blocks.append({"type": "text", "text": _require_text(part.get("refusal"), f"{where}.refusal")})
         else:
             raise ClaudeProviderError(f"{where} 是 assistant 消息，Messages API 不接受其中的 {part_type!r} 片段")
-    return blocks
+    return _drop_blank_text(blocks)
+
+
+def _drop_blank_text(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Host 只拦空串不拦纯空白；整条消息只剩空白文本时 API 返回 400，空白块本身也不携带信息
+    return [block for block in blocks if block["type"] != "text" or block["text"].strip()]
 
 
 def _image_block(part: Mapping[str, Any], where: str) -> dict[str, Any]:
@@ -415,7 +468,7 @@ def _tool_use_block(raw_tool_call: Any, where: str) -> dict[str, Any]:
     tool_call = _require_mapping(raw_tool_call, f"{where}.tool_call")
     return {
         "type": "tool_use",
-        "id": _require_text(tool_call.get("call_id"), f"{where}.tool_call.call_id"),
+        "id": _tool_id(tool_call.get("call_id"), f"{where}.tool_call.call_id"),
         "name": _require_text(tool_call.get("func_name"), f"{where}.tool_call.func_name"),
         "input": dict(_require_mapping(tool_call.get("args"), f"{where}.tool_call.args")),
     }
@@ -424,7 +477,7 @@ def _tool_use_block(raw_tool_call: Any, where: str) -> dict[str, Any]:
 def _tool_result_block(item: Mapping[str, Any], where: str) -> dict[str, Any]:
     block: dict[str, Any] = {
         "type": "tool_result",
-        "tool_use_id": _require_text(item.get("call_id"), f"{where}.call_id"),
+        "tool_use_id": _tool_id(item.get("call_id"), f"{where}.call_id"),
     }
     output = item.get("output")
     if not isinstance(output, str):
@@ -434,6 +487,16 @@ def _tool_result_block(item: Mapping[str, Any], where: str) -> dict[str, Any]:
     if item.get("success") is False:
         block["is_error"] = True
     return block
+
+
+def _tool_id(raw_id: Any, where: str) -> str:
+    call_id = _require_text(raw_id, where)
+    if _TOOL_ID.fullmatch(call_id):
+        return call_id
+    # 任务的 model_list 混用多家 Provider 时，历史里会留着别家生成的 call_id，API 只接受 [A-Za-z0-9_-]；
+    # 替换字符后追加原值摘要，不同 id 不会撞成同一个，同一 id 每轮结果相同也不破坏缓存前缀
+    digest = hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:12]
+    return f"{_TOOL_ID_INVALID_CHAR.sub('_', call_id)}_{digest}"
 
 
 def _parts(raw_parts: Any, where: str) -> list[Mapping[str, Any]]:

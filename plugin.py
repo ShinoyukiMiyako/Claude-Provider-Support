@@ -20,7 +20,9 @@ from .config_models import ClaudeProviderConfig, ProviderSettings
 
 PLUGIN_VERSION = "1.0.0"
 WORKSPACE_HEADER = "anthropic-workspace-id"
-_WORKSPACE_ID = re.compile(r"wrkspc_\S+")
+BETA_HEADER = "anthropic-beta"
+HOST_RPC_MARGIN_SECONDS = 1.0
+_WORKSPACE_ID = re.compile(r"wrkspc_[A-Za-z0-9]+")
 
 
 class ClaudeProviderPlugin(MaiBotPlugin):
@@ -57,12 +59,14 @@ class ClaudeProviderPlugin(MaiBotPlugin):
         if not isinstance(provider, Mapping):
             raise ClaudeProviderError("请求缺少 api_provider 配置快照")
         params = build_message_params(request, self._settings)
+        if "betas" in params:
+            params["betas"] = _merge_configured_betas(provider.get("default_headers"), params["betas"])
         client = self._get_client(provider)
         timeout = float(provider["timeout"])
         try:
-            # Host 等待 RPC 的时长就是 Provider 的 timeout；流式读超时按字节间隔计，
-            # 不限制总时长，所以在这里兜住总时长，避免 Host 放弃后请求还在后台跑
-            async with asyncio.timeout(timeout):
+            # 流式读超时按字节间隔计，不限制总时长，所以在这里兜住总时长，避免 Host 放弃后请求还在后台跑。
+            # Host 等待 RPC 的时长同样是 timeout 且更早开始计时，留出余量才能让下面的超时说明先送到
+            async with asyncio.timeout(max(timeout - HOST_RPC_MARGIN_SECONDS, timeout / 2)):
                 async with client.beta.messages.stream(**params) as stream:
                     message = await stream.get_final_message()
         except TimeoutError as exc:
@@ -79,6 +83,8 @@ class ClaudeProviderPlugin(MaiBotPlugin):
             logger.warning(
                 "模型 %s 的输出达到 max_tokens=%s 上限，正文可能不完整", params["model"], params["max_tokens"]
             )
+        elif raw_data["stop_reason"] == "model_context_window_exceeded":
+            logger.warning("模型 %s 的输入加输出达到上下文窗口上限，正文可能不完整", params["model"])
         return result
 
     @property
@@ -145,6 +151,18 @@ def _validate_headers(raw_headers: Any) -> dict[str, Any]:
                 f"不含空格和引号，实际为 {value!r}"
             )
     return headers
+
+
+def _merge_configured_betas(raw_headers: Any, betas: list[str]) -> list[str]:
+    # SDK 由请求级 betas 生成的 anthropic-beta 头会整体覆盖 default_headers 里的同名头，
+    # 不合并的话 Provider 里配的 beta 在启用兜底的模型上会静默失效
+    configured = [
+        beta.strip()
+        for name, value in dict(raw_headers or {}).items()
+        if name.lower() == BETA_HEADER
+        for beta in str(value).split(",")
+    ]
+    return list(dict.fromkeys([*filter(None, configured), *betas]))
 
 
 def create_plugin() -> ClaudeProviderPlugin:

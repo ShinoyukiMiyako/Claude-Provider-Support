@@ -148,11 +148,48 @@ def test_max_tokens_without_usable_reply_raises(adapter, content, message) -> No
         adapter.parse_message(make_message(content, stop_reason="max_tokens"))
 
 
+def test_context_window_exceeded_with_text_returns_partial_reply(adapter) -> None:
+    result = adapter.parse_message(
+        make_message([{"type": "text", "text": "说到一半"}], stop_reason="model_context_window_exceeded")
+    )
+
+    assert result["output_items"][0]["parts"][0]["text"] == "说到一半"
+    assert result["raw_data"]["stop_reason"] == "model_context_window_exceeded"
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ([{"type": "tool_use", "id": "toolu_1", "name": "search", "input": {}}], "工具调用中途.*上下文窗口"),
+        ([{"type": "thinking", "thinking": "想了很多", "signature": "sig"}], "正文前.*上下文窗口"),
+    ],
+)
+def test_context_window_exceeded_without_usable_reply_raises(adapter, content, message) -> None:
+    with pytest.raises(adapter.ClaudeProviderError, match=message):
+        adapter.parse_message(make_message(content, stop_reason="model_context_window_exceeded"))
+
+
 def test_unhandled_stop_reason_raises(adapter) -> None:
-    with pytest.raises(adapter.ClaudeProviderError, match="model_context_window_exceeded"):
-        adapter.parse_message(
-            make_message([{"type": "text", "text": "x"}], stop_reason="model_context_window_exceeded")
-        )
+    with pytest.raises(adapter.ClaudeProviderError, match="pause_turn"):
+        adapter.parse_message(make_message([{"type": "text", "text": "x"}], stop_reason="pause_turn"))
+
+
+@pytest.mark.parametrize(
+    "content", [[], [{"type": "text", "text": " \n"}], [{"type": "thinking", "thinking": "", "signature": "sig"}]]
+)
+def test_empty_reply_raises_so_host_retries(adapter, content) -> None:
+    with pytest.raises(adapter.ClaudeProviderError, match="没有正文"):
+        adapter.parse_message(make_message(content))
+
+
+def test_blank_text_next_to_thinking_is_not_emitted(adapter) -> None:
+    message = make_message(
+        [{"type": "thinking", "thinking": "该不该回", "signature": "sig"}, {"type": "text", "text": "\n"}]
+    )
+
+    result = adapter.parse_message(message)
+
+    assert [item["item_type"] for item in result["output_items"]] == ["ReasoningItem"]
 
 
 def test_unexpected_block_type_raises(adapter) -> None:

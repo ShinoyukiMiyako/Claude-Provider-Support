@@ -97,7 +97,7 @@ async def test_real_sdk_wire_request_and_stream_parsing(plugin) -> None:
     body = captured["body"]
     assert body["stream"] is True
     assert body["model"] == "claude-opus-5-5"
-    assert body["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+    assert "cache_control" not in body
     assert body["system"] == [{"type": "text", "text": "你是麦麦", "cache_control": {"type": "ephemeral", "ttl": "5m"}}]
     assert body["fallbacks"] == "default"
     assert body["temperature"] == 0.5
@@ -150,4 +150,35 @@ async def test_workspace_header_from_provider_reaches_the_wire(plugin, plugin_mo
     await plugin.handle_llm_request(operation="response", request=request)
 
     assert captured["headers"]["anthropic-workspace-id"] == "wrkspc_01ExampleWorkspaceId0000"
+    await plugin.on_unload()
+
+
+async def test_configured_beta_header_survives_fallback_betas(plugin, plugin_module, monkeypatch) -> None:
+    # 启用兜底时 SDK 用请求级 betas 重写 anthropic-beta，Provider 里配的 beta 必须一并带上
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["headers"] = dict(request.headers)
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=_sse_body())
+
+    real_client = plugin_module.AsyncAnthropic
+
+    def client_with_mock_transport(**kwargs: Any) -> AsyncAnthropic:
+        return real_client(**kwargs, http_client=DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)))
+
+    monkeypatch.setattr(plugin_module, "AsyncAnthropic", client_with_mock_transport)
+    request = make_request([text_item("UserMessageItem", "hi")])
+    request["api_provider"] = {
+        "base_url": "https://api.anthropic.com",
+        "api_key": "sk-ant-test-placeholder",
+        "auth_type": "bearer",
+        "default_headers": {"anthropic-beta": "context-1m-2025-08-07, files-api-2025-04-14"},
+        "default_query": {},
+        "timeout": 30,
+    }
+
+    await plugin.handle_llm_request(operation="response", request=request)
+
+    sent = [beta.strip() for beta in captured["headers"]["anthropic-beta"].split(",")]
+    assert sent == ["context-1m-2025-08-07", "files-api-2025-04-14", "server-side-fallback-2026-07-01"]
     await plugin.on_unload()

@@ -62,6 +62,17 @@ async def test_total_timeout_aborts_stream(plugin, adapter) -> None:
     assert stream.exited is True
 
 
+async def test_total_timeout_fires_before_host_rpc_deadline(plugin, adapter) -> None:
+    # Host 的 RPC 等待同为 timeout 且更早开始计时；插件必须先超时，用户才能看到插件给出的原因
+    stream = FakeStream(make_message([{"type": "text", "text": "迟到"}]), delay=0.3)
+    plugin._get_client = lambda provider: FakeClient(stream)
+    request = make_request([text_item("UserMessageItem", "hi")])
+    request["api_provider"] = _provider(timeout=0.4)
+
+    with pytest.raises(adapter.ClaudeProviderError, match="0.4s"):
+        await plugin.handle_llm_request(operation="response", request=request)
+
+
 @pytest.mark.parametrize("operation", ["embedding", "audio_transcription", "image_embedding"])
 async def test_non_chat_operations_are_rejected(plugin, adapter, operation) -> None:
     with pytest.raises(adapter.ClaudeProviderError, match=operation):
@@ -93,6 +104,7 @@ async def test_clients_are_reused_per_provider_and_closed_on_unload(plugin) -> N
         ({"api_key": ""}, "api_key 为空"),
         ({"default_headers": {"anthropic-workspace-id": " wrkspc_01ExampleWorkspaceId0000"}}, "wrkspc_"),
         ({"default_headers": {"Anthropic-Workspace-Id": "Default"}}, "Anthropic-Workspace-Id"),
+        ({"default_headers": {"anthropic-workspace-id": 'wrkspc_01ExampleWorkspaceId0000"'}}, "wrkspc_"),
     ],
 )
 def test_invalid_provider_config_is_rejected(plugin, adapter, overrides, message) -> None:

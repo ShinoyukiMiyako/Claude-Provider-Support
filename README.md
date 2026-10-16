@@ -10,7 +10,7 @@ MaiBot WebUI 自带的 "Anthropic (Claude)" 模板走的是 `client_type = "open
 
 | 能力 | OpenAI 兼容层 | 本插件 |
 |---|---|---|
-| 提示缓存 | 不支持 | system、聊天历史、整段请求三处缓存断点，命中部分按缓存读取价计费（Opus 5.5 为输入价的 0.05 倍） |
+| 提示缓存 | 不支持 | system 与聊天历史两处缓存断点，命中部分按缓存读取价计费（Opus 5.5 为输入价的 0.05 倍） |
 | 思考内容 | 不返回 | 返回思考摘要，MaiBot 中显示为 reasoning |
 | `json_schema` 结构化输出 | `response_format` 被忽略 | 映射为 `output_config.format`，按 schema 强约束 |
 | 推理强度 | `reasoning_effort` 被忽略 | 映射为 `output_config.effort` |
@@ -71,8 +71,9 @@ model_list = ["claude-opus-5-5"]
   anthropic-workspace-id = "wrkspc_..."
   ```
 
-  WebUI 的 Provider 编辑页里也可以直接加这个请求头。插件会校验它的值必须是 `wrkspc_` 开头、不含空格，格式不对时直接报错，不会把请求发出去换回一个看不出原因的 400。
-- **`max_tokens`**：MaiBot 任务默认只有 4096。思考 token 也计入这个上限，耗尽时插件会报错并提示调大，正文被截断时只记警告并返回已生成的部分。
+  WebUI 的 Provider 编辑页里也可以直接加这个请求头。插件会校验它的值必须是 `wrkspc_` 加字母数字，格式不对（多了空格、引号等）时直接报错，不会把请求发出去换回一个看不出原因的 400。
+- **`anthropic-beta`**：也可以加在 `default_headers` 里开启其他 beta。启用拒答兜底的模型请求时会自带一个 beta，插件会把你配的值合并进去，不会被覆盖。
+- **`max_tokens`**：MaiBot 任务默认只有 4096。思考 token 也计入这个上限，耗尽时插件会报错并提示调大，正文被截断时只记警告并返回已生成的部分。输入加输出撑满模型上下文窗口（`model_context_window_exceeded`）时同样处理。
 - **价格**：MaiBot 按"元 / M token"统计。Opus 5.5 官方价为输入 $4、输出 $20、缓存读取 $0.20（每百万 token），请按汇率换算后填入 `price_in` / `price_out` / `cache_price_in`。缓存写入的 1.25 倍（5m）/ 2 倍（1h）溢价在 MaiBot 统计里体现不出来。
 
 ### extra_params
@@ -95,17 +96,22 @@ model_list = ["claude-opus-5-5"]
 | `prompt_cache` | `true` | 是否打缓存断点 |
 | `cache_ttl` | `5m` | 缓存存活时间；群聊消息间隔经常超过 5 分钟时改成 `1h` |
 | `thinking_display` | `summarized` | `summarized` 返回思考摘要；`omitted` 不返回思考文本，计费不变 |
-| `refusal_fallback` | `true` | 只对 `claude-opus-5-5`、`claude-opus-5`、`claude-fable-5-1`、`claude-sonnet-5-5` 生效 |
+| `refusal_fallback` | `true` | 只对 `claude-opus-5-5`、`claude-opus-5`、`claude-fable-5-1`、`claude-fable-5`、`claude-sonnet-5-5` 生效 |
 
 ## 行为说明
 
-- **缓存**：一个断点打在最后一个 system 块上；一个打在最后一条模型侧内容（assistant 回复或 tool_result）上，覆盖到聊天历史末尾；再加一个请求级自动断点覆盖整段请求。MaiBot 每轮都会在末尾拼接时间、回复要求等一次性内容，第二个断点让历史部分不受这段尾巴影响仍能命中。同一条消息里被表情切开的文字片段会拼回一个文本块，避免长消息把断点挤出 API 的 20 块回看范围。MaiBot 按窗口裁剪历史时，消息前缀会变，但 tools + system 仍能命中。命中情况看 MaiBot 统计页的缓存命中数；如果长期为 0，通常是 system 提示里含有每次都变的内容（时间、随机值等）。
+- **缓存**：一个断点打在最后一个 system 块上；另一个打在最后一条模型侧内容（assistant 回复、工具调用或 tool_result）上，覆盖到聊天历史末尾。MaiBot 每轮都会在末尾拼接时间、回复要求等一次性内容，这段之后不打断点：打了也只会每轮按 1.25 倍（1h 为 2 倍）付写入费，下一轮读不到。同一条消息里被表情切开的文字片段会拼回一个文本块，避免长消息把断点挤出 API 的 20 块回看范围。MaiBot 按窗口裁剪历史时，消息前缀会变，但 tools + system 仍能命中。命中情况看 MaiBot 统计页的缓存命中数；如果长期为 0，通常是 system 提示里含有每次都变的内容（时间、随机值等）。
 - **思考不回传**：MaiBot 不会把 Provider 原生的回放数据传给插件，带签名的 thinking 块因此回传不了。官方允许不回传，代价是工具调用循环里推理的连续性会变差。这样做也更稳妥：MaiBot 会改写历史，而对 2026-08-31 及之后创建的账号，Opus 5.5 会校验回传的思考块所在的历史是否被改动过，改动过就返回 400。
-- **system 消息**：开头的 system 消息合并成顶层 `system`；对话中途出现的 system 消息原样以 `role: "system"` 发送（Opus 4.8 / 5 / 5.5、Sonnet 5.5、Haiku 5.5、Fable 系列支持；Sonnet 5 及更早的模型会由 API 报错）。
+- **system 消息**：开头的 system 消息合并成顶层 `system`；对话中途出现的 system 消息以 `role: "system"` 发送（Opus 4.8 / 5 / 5.5、Sonnet 5.5、Haiku 5.5、Fable 系列支持；Sonnet 5 及更早的模型会由 API 报错）。API 只接受紧跟 user、且位于末尾或紧接 assistant 的中途 system，其他位置的会改成 user 文本发送，内容不丢。
+- **消息形状修正**：以下几种 API 会直接返回 400 的形状，插件发送前自动修正。
+  - 只有空白的文本：不发送，整条只剩空白的消息整条去掉。
+  - 同一条 user 消息里 tool_result 排在文字后面：挪到最前。
+  - 别家 Provider 生成、含 `[A-Za-z0-9_-]` 以外字符的工具调用 id：替换字符并追加原 id 的摘要，每轮结果一致，不影响缓存。
+- **空响应**：既没有正文、也没有工具调用和思考摘要时报错，由 MaiBot 按 `max_retry` 重试，与内置客户端一致。
 - **拒答**：`stop_reason = "refusal"` 时报错，错误信息带拒答类别和说明。启用兜底且模型支持时，由服务端自动换模型重答，日志会记录由哪个模型兜底。MaiBot 的计价仍按原模型的价格统计。
 - **图片**：MaiBot 内部的 `jpg` 会转成 `image/jpeg`；支持 jpeg / png / gif / webp。
 - **响应格式**：`json_schema` 经 `anthropic.transform_schema` 规整后走结构化输出（会自动补 `additionalProperties: false`，不支持的约束挪进描述）。`json_object` 没有对应的 API 能力，以追加 system 指令的方式约束。
-- **重试与超时**：SDK 自身不重试（`max_retries=0`），由 MaiBot 按 Provider 的 `max_retry` 统一重试，避免两层重试叠加超出 MaiBot 的等待时间。注意 MaiBot 会重试插件的所有失败，包括 400。整个请求的总时长受 Provider `timeout` 限制，超时后插件会主动断开流式连接。
+- **重试与超时**：SDK 自身不重试（`max_retries=0`），由 MaiBot 按 Provider 的 `max_retry` 统一重试，避免两层重试叠加超出 MaiBot 的等待时间。注意 MaiBot 会重试插件的所有失败，包括 400。整个请求的总时长受 Provider `timeout` 限制：MaiBot 等待插件的时长也是 `timeout`，插件提前约 1 秒主动断开流式连接，报错里会写明是超时。
 - **不支持的能力**：Claude API 没有 embedding、音频转写、图片嵌入，这些任务请继续用其他 Provider。
 
 ## 开发与验证
