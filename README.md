@@ -1,4 +1,6 @@
-# Claude 官方 API Provider（MaiBot 插件）
+# Claude Provider Support
+
+MaiBot 插件。
 
 用官方 `anthropic` Python SDK 原生调用 Claude Messages API（`POST /v1/messages`），为 MaiBot 注册客户端类型 `claude`。注册后，Claude 模型可以像内置模型一样放进 `replyer`、`planner`、`utils` 等任何任务。
 
@@ -8,7 +10,7 @@ MaiBot WebUI 自带的 "Anthropic (Claude)" 模板走的是 `client_type = "open
 
 | 能力 | OpenAI 兼容层 | 本插件 |
 |---|---|---|
-| 提示缓存 | 不支持 | system 与整段对话两个缓存断点，命中部分按缓存读取价计费（Opus 5.5 为输入价的 0.05 倍） |
+| 提示缓存 | 不支持 | system、聊天历史、整段请求三处缓存断点，命中部分按缓存读取价计费（Opus 5.5 为输入价的 0.05 倍） |
 | 思考内容 | 不返回 | 返回思考摘要，MaiBot 中显示为 reasoning |
 | `json_schema` 结构化输出 | `response_format` 被忽略 | 映射为 `output_config.format`，按 schema 强约束 |
 | 推理强度 | `reasoning_effort` 被忽略 | 映射为 `output_config.effort` |
@@ -16,7 +18,9 @@ MaiBot WebUI 自带的 "Anthropic (Claude)" 模板走的是 `client_type = "open
 
 ## 安装
 
-把下面四个文件放进 MaiBot 的 `plugins/` 下任意一个子目录（例如 `plugins/claude_provider/`），然后重启 MaiBot：
+在 MaiBot WebUI 的插件中心搜索 "Claude Provider Support" 安装。
+
+也可以手动安装：把本仓库克隆到 MaiBot 的 `plugins/` 下（例如 `plugins/claude_provider/`），或只复制下面四个文件进去，然后重启 MaiBot：
 
 - `_manifest.json`
 - `plugin.py`
@@ -95,7 +99,7 @@ model_list = ["claude-opus-5-5"]
 
 ## 行为说明
 
-- **缓存**：一个断点打在最后一个 system 块上，另一个是请求级自动断点，覆盖整段对话。MaiBot 按窗口裁剪历史时，消息前缀会变，但 tools + system 仍能命中。命中情况看 MaiBot 统计页的缓存命中数；如果长期为 0，通常是 system 提示里含有每次都变的内容（时间、随机值等）。
+- **缓存**：一个断点打在最后一个 system 块上；一个打在最后一条模型侧内容（assistant 回复或 tool_result）上，覆盖到聊天历史末尾；再加一个请求级自动断点覆盖整段请求。MaiBot 每轮都会在末尾拼接时间、回复要求等一次性内容，第二个断点让历史部分不受这段尾巴影响仍能命中。同一条消息里被表情切开的文字片段会拼回一个文本块，避免长消息把断点挤出 API 的 20 块回看范围。MaiBot 按窗口裁剪历史时，消息前缀会变，但 tools + system 仍能命中。命中情况看 MaiBot 统计页的缓存命中数；如果长期为 0，通常是 system 提示里含有每次都变的内容（时间、随机值等）。
 - **思考不回传**：MaiBot 不会把 Provider 原生的回放数据传给插件，带签名的 thinking 块因此回传不了。官方允许不回传，代价是工具调用循环里推理的连续性会变差。这样做也更稳妥：MaiBot 会改写历史，而对 2026-08-31 及之后创建的账号，Opus 5.5 会校验回传的思考块所在的历史是否被改动过，改动过就返回 400。
 - **system 消息**：开头的 system 消息合并成顶层 `system`；对话中途出现的 system 消息原样以 `role: "system"` 发送（Opus 4.8 / 5 / 5.5、Sonnet 5.5、Haiku 5.5、Fable 系列支持；Sonnet 5 及更早的模型会由 API 报错）。
 - **拒答**：`stop_reason = "refusal"` 时报错，错误信息带拒答类别和说明。启用兜底且模型支持时，由服务端自动换模型重答，日志会记录由哪个模型兜底。MaiBot 的计价仍按原模型的价格统计。
@@ -119,8 +123,16 @@ uv run ruff format --check .
 MAIBOT_ROOT=/path/to/MaiBot /path/to/MaiBot/.venv/bin/python -m pytest tests
 ```
 
-真实 API 冒烟测试共发 4 次小请求，验证参数组合被接受、缓存命中和工具调用续接：
+真实 API 冒烟测试共发 6 次小请求，验证参数组合被接受、缓存命中（含末尾每轮变化时的历史命中）和工具调用续接：
 
 ```bash
 ANTHROPIC_API_KEY=<你的 Key> ANTHROPIC_WORKSPACE_ID=<仅多工作区 Key 需要> uv run python scripts/live_smoke.py --model claude-haiku-5-5
 ```
+
+## 兼容版本
+
+已验证 MaiBot 1.3.9、插件 SDK 2.12.0 ~ 2.14.0，manifest 只声明这个范围。MaiBot 1.3.x 的后续补丁版本会以兼容模式加载；更高的 MaiBot 次版本或 SDK 高于 2.14.0 时宿主会拒绝加载，需要等插件验证后发布新版本。
+
+## 许可证
+
+[GNU Affero General Public License v3.0](./LICENSE)（`AGPL-3.0-only`）。

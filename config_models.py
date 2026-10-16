@@ -6,7 +6,7 @@ from maibot_sdk import Field, PluginConfigBase
 
 
 class ProviderSettings(PluginConfigBase):
-    __ui_label__ = "Claude Provider 设置"
+    __ui_label__ = "Claude Provider Support 设置"
     __ui_icon__ = "brain"
 
     config_version: str = Field(

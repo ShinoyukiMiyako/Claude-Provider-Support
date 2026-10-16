@@ -18,7 +18,7 @@ from .claude_adapter import (
 )
 from .config_models import ClaudeProviderConfig, ProviderSettings
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "1.0.0"
 WORKSPACE_HEADER = "anthropic-workspace-id"
 _WORKSPACE_ID = re.compile(r"wrkspc_\S+")
 

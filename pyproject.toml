@@ -1,7 +1,8 @@
 [project]
-name = "maibot-claude-provider"
-version = "0.1.0"
-description = "MaiBot LLM Provider plugin for the official Claude Messages API"
+name = "claude-provider-support"
+version = "1.0.0"
+description = "Claude Provider Support: MaiBot LLM Provider plugin for the official Claude Messages API"
+license = "AGPL-3.0-only"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=1.14.0,<2.0.0",
