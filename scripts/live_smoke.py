@@ -1,6 +1,6 @@
 """用真实 Claude API 冒烟：参数组合被接受、同前缀第二次请求命中缓存、工具调用不回放思考也能续接。
 
-只走插件的 handle_llm_request，不依赖 MaiBot。共发 4 次小请求，用 Opus 5.5 时总花费约 0.1 美元以内，Haiku 5.5 更低。
+只走插件的 handle_llm_request，不依赖 MaiBot。共发 6 次小请求，用 Opus 5.5 时总花费约 0.1 美元以内，Haiku 5.5 更低。
 
     $env:ANTHROPIC_API_KEY = "<你的 Key>"
     $env:ANTHROPIC_WORKSPACE_ID = "wrkspc_..."   # 仅当 Key 未限定到单个工作区时需要
@@ -151,6 +151,38 @@ async def run(model: str) -> int:
                 request=build_request(model, provider, replay, tool_options=[WEATHER_TOOL]),
             )
             checks.append(("不回放思考块也能续接工具结果", "22" in text_of(final), text_of(final)))
+
+        # MaiBot 的形状：每轮在历史末尾重新拼当前时间等一次性内容，下一轮这段就换掉了
+        history = [system]
+        for index in range(1, 9):
+            history.append(item("UserMessageItem", f"第 {index} 件事：{'今天的流水账细节' * 12}", f"h{index}"))
+            history.append(item("AssistantMessageItem", f"收到第 {index} 件事", f"h{index}"))
+        round_one = await plugin.handle_llm_request(
+            operation="response",
+            request=build_request(model, provider, [*history, item("UserMessageItem", "当前时间：05:00，回一个字")]),
+        )
+        round_two = await plugin.handle_llm_request(
+            operation="response",
+            request=build_request(
+                model,
+                provider,
+                [
+                    *history,
+                    item("UserMessageItem", "第 9 件事：睡了"),
+                    item("AssistantMessageItem", "晚安"),
+                    item("UserMessageItem", "当前时间：05:01，回一个字"),
+                ],
+            ),
+        )
+        first_hit = round_one["usage"].get("prompt_cache_hit_tokens", 0)
+        second_hit = round_two["usage"].get("prompt_cache_hit_tokens", 0)
+        checks.append(
+            (
+                "末尾每轮不同的请求也能命中整段历史",
+                second_hit > first_hit,
+                f"第一轮命中 {first_hit}，第二轮命中 {second_hit}，第二轮输入 {round_two['usage']['prompt_tokens']}",
+            )
+        )
     finally:
         await plugin.on_unload()
 

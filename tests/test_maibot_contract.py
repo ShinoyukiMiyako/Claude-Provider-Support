@@ -159,10 +159,12 @@ def test_host_snapshot_maps_to_claude_params(host: SimpleNamespace, adapter: Any
     assert params["messages"][1]["content"] == [
         {"type": "tool_use", "id": "call_1", "name": "search", "input": {"q": "猫"}}
     ]
+    # 工具结果是最后一块模型侧内容，后面还有本轮的用户消息，历史断点落在它上面
     assert params["messages"][2]["content"][0] == {
         "type": "tool_result",
         "tool_use_id": "call_1",
         "content": "找到 3 条",
+        "cache_control": {"type": "ephemeral", "ttl": "5m"},
     }
     assert params["tools"][0]["input_schema"]["required"] == ["q"]
     assert params["output_config"]["effort"] == "high"

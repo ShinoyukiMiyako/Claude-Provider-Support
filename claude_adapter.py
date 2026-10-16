@@ -91,6 +91,7 @@ def build_message_params(request: Mapping[str, Any], settings: ProviderSettings)
     if output_config:
         params["output_config"] = output_config
     if cache_control is not None:
+        _mark_shared_prefix_end(messages, cache_control)
         params["cache_control"] = cache_control
     temperature = request.get("temperature")
     if temperature is not None:
@@ -141,7 +142,7 @@ def build_conversation(raw_items: Any) -> tuple[list[dict[str, Any]], list[dict[
             else:
                 system_blocks.extend(blocks)
         elif item_type == "UserMessageItem":
-            _append_message(messages, "user", _user_blocks(item.get("parts"), where))
+            _append_user_blocks(messages, _user_blocks(item.get("parts"), where))
         elif item_type == "AssistantMessageItem":
             _append_message(messages, "assistant", _assistant_blocks(item.get("parts"), where))
         elif item_type == "FunctionCallItem":
@@ -317,6 +318,36 @@ def _read_max_tokens(raw_value: Any) -> int:
     return raw_value
 
 
+def _mark_shared_prefix_end(messages: list[dict[str, Any]], cache_control: Mapping[str, Any]) -> None:
+    # MaiBot 每轮都在末尾重新拼接时间、人物画像、回复方向等一次性内容，请求级自动断点落在这段之后，
+    # 下一轮末尾一换就再也读不到，只剩 system 能命中。最后一块模型产出（回复、工具调用或其结果）之前的
+    # 内容下一轮必然原样出现，在这里补一个断点，下一轮从自己的断点回看 20 个位置即可命中整段历史
+    last_message = len(messages) - 1
+    for message_index in range(last_message, -1, -1):
+        message = messages[message_index]
+        content = message["content"]
+        for block_index in range(len(content) - 1, -1, -1):
+            block = content[block_index]
+            if message["role"] != "assistant" and block.get("type") != "tool_result":
+                continue
+            if message_index == last_message and block_index == len(content) - 1:
+                # 已是整个请求的最后一块，请求级自动断点就落在这里，再标一次会重复占用断点名额
+                return
+            content[block_index] = {**block, "cache_control": dict(cache_control)}
+            return
+
+
+def _append_user_blocks(messages: list[dict[str, Any]], blocks: list[dict[str, Any]]) -> None:
+    # 缓存断点只回看 20 个块。群友连发一串消息时每条都单独成块，下一轮的历史断点会够不着上一轮写入的位置，
+    # 所以相邻用户消息的文字用换行接成一个块；图片和工具结果仍各自成块
+    if messages and messages[-1]["role"] == "user" and blocks:
+        content = messages[-1]["content"]
+        if content and content[-1]["type"] == "text" and blocks[0]["type"] == "text":
+            content[-1] = {"type": "text", "text": f"{content[-1]['text']}\n{blocks[0]['text']}"}
+            blocks = blocks[1:]
+    _append_message(messages, "user", blocks)
+
+
 def _append_message(messages: list[dict[str, Any]], role: str, blocks: list[dict[str, Any]]) -> None:
     # 连续同角色合并成一条，保证 tool_use 与 tool_result 各自落在相邻的单条消息里
     if messages and messages[-1]["role"] == role:
@@ -339,7 +370,12 @@ def _user_blocks(raw_parts: Any, where: str) -> list[dict[str, Any]]:
     for part in _parts(raw_parts, where):
         part_type = part.get("type")
         if part_type == "text":
-            blocks.append({"type": "text", "text": _require_text(part.get("text"), f"{where}.text")})
+            text = _require_text(part.get("text"), f"{where}.text")
+            if blocks and blocks[-1]["type"] == "text":
+                # MaiBot 会把一条消息按表情等切成多段（一句歌词能切出几十段），原样拼回同一条消息
+                blocks[-1] = {"type": "text", "text": blocks[-1]["text"] + text}
+            else:
+                blocks.append({"type": "text", "text": text})
         elif part_type == "image":
             blocks.append(_image_block(part, where))
         else:

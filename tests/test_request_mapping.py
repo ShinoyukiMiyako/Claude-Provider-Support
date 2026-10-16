@@ -159,6 +159,120 @@ def test_default_params_enable_cache_thinking_and_fallback(adapter, settings) ->
     assert "output_config" not in params
 
 
+def _block_breakpoints(params: dict) -> list[tuple[int, int]]:
+    return [
+        (message_index, block_index)
+        for message_index, message in enumerate(params["messages"])
+        for block_index, block in enumerate(message["content"])
+        if "cache_control" in block
+    ]
+
+
+def test_history_breakpoint_lands_before_per_request_tail(adapter, settings) -> None:
+    # MaiBot 的形状：历史聊天 + 机器人上一轮回复，末尾再拼本轮才有的时间与回复方向
+    items = [
+        text_item("SystemMessageItem", "你是白洲梓"),
+        text_item("UserMessageItem", "通宵喵"),
+        text_item("AssistantMessageItem", "好家伙"),
+        text_item("UserMessageItem", "多刷回手机"),
+        text_item("UserMessageItem", "当前时间：05:03:16"),
+        text_item("UserMessageItem", "回复方向：跟着笑一下"),
+    ]
+
+    params = adapter.build_message_params(make_request(items), settings)
+
+    assert _block_breakpoints(params) == [(1, 0)]
+    assert params["messages"][1]["content"][0] == {
+        "type": "text",
+        "text": "好家伙",
+        "cache_control": {"type": "ephemeral", "ttl": "5m"},
+    }
+    # system + 历史 + 请求级自动断点，不超过 API 的 4 个上限
+    assert params["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+
+
+def test_history_breakpoint_uses_tool_result_when_it_is_the_latest_model_side_block(adapter, settings) -> None:
+    params = adapter.build_message_params(make_request(_tool_round_items()), settings)
+
+    # 最后一块模型侧内容是 call_b 的结果，后面的“继续”留给请求级自动断点
+    assert _block_breakpoints(params) == [(2, 1)]
+    assert params["messages"][2]["content"][1]["tool_use_id"] == "call_b"
+
+
+def test_no_history_breakpoint_when_model_side_block_is_already_last(adapter, settings) -> None:
+    items = [*_tool_round_items()[:-1]]
+
+    params = adapter.build_message_params(make_request(items), settings)
+
+    assert _block_breakpoints(params) == []
+    assert params["cache_control"] == {"type": "ephemeral", "ttl": "5m"}
+
+
+def test_no_history_breakpoint_without_model_side_blocks(adapter, settings) -> None:
+    items = [text_item("SystemMessageItem", "你是白洲梓"), text_item("UserMessageItem", "在吗")]
+
+    params = adapter.build_message_params(make_request(items), settings)
+
+    assert _block_breakpoints(params) == []
+
+
+def test_split_message_parts_are_joined_back_into_one_block(adapter) -> None:
+    item = {
+        "item_type": "UserMessageItem",
+        "meta": meta(),
+        "parts": [
+            {"type": "text", "text": "哦耶耶～桃花"},
+            {"type": "text", "text": "🌸"},
+            {"type": "text", "text": "谢了有玫瑰"},
+            {"type": "image", "image_format": "png", "image_base64": "QUJD"},
+            {"type": "text", "text": "看图"},
+        ],
+    }
+
+    _, messages = adapter.build_conversation([item])
+
+    assert [block["type"] for block in messages[0]["content"]] == ["text", "image", "text"]
+    assert messages[0]["content"][0]["text"] == "哦耶耶～桃花🌸谢了有玫瑰"
+    assert messages[0]["content"][2]["text"] == "看图"
+
+
+def test_consecutive_user_messages_share_one_text_block(adapter) -> None:
+    items = [
+        text_item("UserMessageItem", "第一条"),
+        text_item("UserMessageItem", "第二条"),
+        text_item("AssistantMessageItem", "收到"),
+        *_tool_round_items()[4:8],
+        text_item("UserMessageItem", "第三条"),
+        text_item("UserMessageItem", "第四条"),
+    ]
+
+    _, messages = adapter.build_conversation(items)
+
+    assert messages[0]["content"] == [{"type": "text", "text": "第一条\n第二条"}]
+    # 工具结果不与文字合并，结果之后的文字仍合成一块
+    assert [block["type"] for block in messages[2]["content"]] == ["tool_result", "tool_result", "text"]
+    assert messages[2]["content"][2]["text"] == "第三条\n第四条"
+
+
+def test_message_burst_stays_within_cache_lookback(adapter, settings) -> None:
+    # 两轮之间群友连发 30 条：下一轮的历史断点到上一轮断点之间仍只隔几个块，不超出 20 块回看范围
+    burst = [text_item("UserMessageItem", f"第 {index} 条") for index in range(30)]
+    items = [
+        text_item("SystemMessageItem", "你是白洲梓"),
+        text_item("AssistantMessageItem", "上一轮回复"),
+        *burst,
+        text_item("AssistantMessageItem", "这一轮回复"),
+        text_item("UserMessageItem", "当前时间：05:03"),
+    ]
+
+    params = adapter.build_message_params(make_request(items), settings)
+
+    flat = [block for message in params["messages"] for block in message["content"]]
+    previous_anchor = next(i for i, block in enumerate(flat) if block.get("text") == "上一轮回复")
+    current_anchor = next(i for i, block in enumerate(flat) if "cache_control" in block)
+    assert current_anchor - previous_anchor <= 20
+
+
 def test_cache_disabled_leaves_no_breakpoints(adapter, config_models) -> None:
     settings = config_models.ProviderSettings(prompt_cache=False)
 
@@ -166,6 +280,7 @@ def test_cache_disabled_leaves_no_breakpoints(adapter, config_models) -> None:
 
     assert "cache_control" not in params
     assert all("cache_control" not in block for block in params["system"])
+    assert _block_breakpoints(params) == []
 
 
 def test_one_hour_ttl_applies_to_both_breakpoints(adapter, config_models) -> None:
