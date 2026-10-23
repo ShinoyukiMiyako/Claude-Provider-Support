@@ -1,16 +1,17 @@
 [project]
 name = "claude-provider-support"
-version = "1.0.0"
-description = "Claude Provider Support: MaiBot LLM Provider plugin for the official Claude Messages API"
+version = "2.0.0"
+description = "Claude Provider Support: MaiBot LLM Provider plugin for the Claude Messages API and compatible endpoints"
 license = "AGPL-3.0-only"
 requires-python = ">=3.12"
+# 与 manifest 的 dependencies 一一对应；maibot-plugin-sdk 由宿主提供，版本范围写在 manifest 的 sdk 字段
 dependencies = [
-    "anthropic>=1.14.0,<2.0.0",
-    "maibot-plugin-sdk>=2.12.0,<3.0.0",
+    "anthropic>=2.1.0,<3.0.0",
 ]
 
 [dependency-groups]
 dev = [
+    "maibot-plugin-sdk>=2.12.0,<3.0.0",
     "pytest>=8.4",
     "pytest-asyncio>=1.2",
     "ruff>=0.14",

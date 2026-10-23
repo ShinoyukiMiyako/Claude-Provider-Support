@@ -4,6 +4,8 @@ MaiBot 插件。
 
 用官方 `anthropic` Python SDK 原生调用 Claude Messages API（`POST /v1/messages`），为 MaiBot 注册客户端类型 `claude`。注册后，Claude 模型可以像内置模型一样放进 `replyer`、`planner`、`utils` 等任何任务。
 
+除官方 API 外，也可以接任何兼容 Anthropic Messages 协议的端点：中转站、网关，以及 DeepSeek、Kimi、GLM 等厂商提供的 `/anthropic` 接口。见下文[兼容端点](#兼容端点)。
+
 ## 为什么不用 OpenAI 兼容层
 
 MaiBot WebUI 自带的 "Anthropic (Claude)" 模板走的是 `client_type = "openai"` + Anthropic 的 OpenAI SDK 兼容层。官方明确说明兼容层主要用于测试对比，不建议长期或生产使用，而且会丢掉以下能力：
@@ -27,9 +29,9 @@ MaiBot WebUI 自带的 "Anthropic (Claude)" 模板走的是 `client_type = "open
 - `claude_adapter.py`
 - `config_models.py`
 
-依赖 `anthropic>=1.14.0,<2.0.0` 已在 manifest 中声明，MaiBot 启动时的插件依赖同步会用 uv 自动安装，无需手动 `pip install`。
+依赖 `anthropic>=2.1.0,<3.0.0` 已在 manifest 中声明，MaiBot 启动时的插件依赖同步会用 uv 自动安装，无需手动 `pip install`。anthropic 2.x 默认使用 API 版本 `2026-10-21`。
 
-运行 MaiBot 的机器需要能访问 `api.anthropic.com`。SDK 会遵循 `HTTPS_PROXY` 等代理环境变量；MaiBot 的 Provider 配置本身没有代理字段。
+运行 MaiBot 的机器需要能访问 `api.anthropic.com` 或你配置的端点。SDK 会遵循 `HTTPS_PROXY` 等代理环境变量；MaiBot 的 Provider 配置本身没有代理字段。
 
 ## 模型配置
 
@@ -62,8 +64,8 @@ model_list = ["claude-opus-5-5"]
 
 几个必须注意的点：
 
-- **`send_temperature = false`**：Claude Opus 4.7 及之后的模型收到任何 `temperature` 都返回 400，Sonnet 5.5 / Haiku 5.5 只接受默认值。MaiBot 任务默认温度是 0.7，不关掉就会每次请求都失败。插件不会替你吞掉这个参数：开着就原样发给 API。
-- **`auth_type` 保持默认值 `bearer`**：插件固定通过 `x-api-key` 头鉴权，其他取值会直接报错。
+- **`send_temperature = false`**：API 版本 `2026-10-21` 起，官方 API 对任何模型的 `temperature` / `top_p` / `top_k` 都返回 400。MaiBot 任务默认温度是 0.7，不关掉就会每次请求都失败。插件不会替你吞掉这个参数：开着就原样发出，兼容端点多数仍接受它。
+- **`auth_type` 保持默认值 `bearer`**：Key 以 `Authorization: Bearer` 发送，官方 API 接受。其他鉴权方式见[兼容端点](#兼容端点)。
 - **workspace ID**：只有 Key 没有限定到单个工作区时才需要（个人 Key 或服务账号 Key 创建时选了多个工作区），缺了 API 会返回 400。ID 在 Console 的 Workspaces 页 ID 列，格式为 `wrkspc_...`，加在 Provider 下：
 
   ```toml
@@ -96,7 +98,32 @@ model_list = ["claude-opus-5-5"]
 | `prompt_cache` | `true` | 是否打缓存断点 |
 | `cache_ttl` | `5m` | 缓存存活时间；群聊消息间隔经常超过 5 分钟时改成 `1h` |
 | `thinking_display` | `summarized` | `summarized` 返回思考摘要；`omitted` 不返回思考文本，计费不变 |
-| `refusal_fallback` | `true` | 只对 `claude-opus-5-5`、`claude-opus-5`、`claude-fable-5-1`、`claude-fable-5`、`claude-sonnet-5-5` 生效 |
+| `refusal_fallback` | `true` | 只在官方 API（`api.anthropic.com`）上对 `claude-opus-5-5`、`claude-opus-5`、`claude-fable-5-1`、`claude-fable-5`、`claude-sonnet-5-5` 生效 |
+
+插件设置对所有使用 `claude` 客户端的 Provider 生效，不区分官方 API 和兼容端点。
+
+## 兼容端点
+
+`base_url` 填端点的 Messages API 根地址，SDK 会在后面拼 `/v1/messages`，所以末尾不要带 `/v1`。例如端点文档写的是 `https://example.com/anthropic/v1/messages`，就填 `https://example.com/anthropic`。
+
+鉴权沿用 MaiBot Provider 的 `auth_type` 字段，语义与内置 OpenAI 兼容客户端一致：
+
+| `auth_type` | 发送方式 | 典型用途 |
+|---|---|---|
+| `bearer`（默认） | `Authorization: Bearer <key>`；改了 `auth_header_name` / `auth_header_prefix` 时按改后的头发送 | 官方 API、多数中转站 |
+| `header` | `<auth_header_name>: <auth_header_prefix> <key>`，前缀留空则只发 Key | 只认 `x-api-key` 的端点：`auth_header_name = "x-api-key"`、`auth_header_prefix = ""` |
+| `query` | 查询参数 `<auth_query_name>=<key>` | 用 URL 参数鉴权的网关 |
+| `none` | 不发凭据，`api_key` 可留空 | 内网不鉴权的网关 |
+
+除默认的 `bearer` 外，插件都不让 SDK 自己找凭据：宿主上的 `ANTHROPIC_API_KEY` 等环境变量和本机 profile 不会被带给第三方端点。
+
+只有官方 API 才有的能力，插件会自动避开，其余参数照常发送，端点不支持时由它返回错误：
+
+- **拒答兜底**：`fallbacks` 和对应 beta 只发给 `api.anthropic.com`，兼容端点即使用同名模型也不发。
+- **思考**：默认发送 `thinking: {type: "adaptive"}`。端点不支持时在该模型的 `extra_params` 里写 `thinking = "omit"`。
+- **提示缓存**：`cache_control` 是插件级开关。端点拒绝该字段时关掉 `prompt_cache`。
+- **API 版本**：SDK 发送 `anthropic-version: 2026-10-21`。只认旧版本的端点可以在 Provider 的 `default_headers` 里写 `anthropic-version = "2023-06-01"` 覆盖。
+- **`temperature`**：开着 `send_temperature` 就原样发出。
 
 ## 行为说明
 
@@ -123,7 +150,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-宿主契约测试会用 MaiBot 自己的类型构造请求、加载插件、回收输出，需要在 MaiBot 的虚拟环境里运行：
+宿主契约测试会用 MaiBot 自己的类型构造请求、加载插件、回收输出，需要在装了 `anthropic>=2.1.0` 的 MaiBot 虚拟环境里运行：
 
 ```bash
 MAIBOT_ROOT=/path/to/MaiBot /path/to/MaiBot/.venv/bin/python -m pytest tests
@@ -137,7 +164,10 @@ ANTHROPIC_API_KEY=<你的 Key> ANTHROPIC_WORKSPACE_ID=<仅多工作区 Key 需�
 
 ## 兼容版本
 
-已验证 MaiBot 1.3.9、插件 SDK 2.12.0 ~ 2.14.0，manifest 只声明这个范围。MaiBot 1.3.x 的后续补丁版本会以兼容模式加载；更高的 MaiBot 次版本或 SDK 高于 2.14.0 时宿主会拒绝加载，需要等插件验证后发布新版本。
+manifest 声明的范围是 **MaiBot 1.3.9 ~ 1.3.14、插件 SDK 2.12.0 ~ 2.16.0**，两端都跑过宿主契约测试。超出范围时宿主的处理：
+
+- **MaiBot**：1.3.x 中高于 1.3.14 的补丁版本以兼容模式加载，日志会提示；1.4 及更高的次版本拒绝加载，需要等插件验证后发布新版本。
+- **插件 SDK**：MaiBot 1.3.9 遇到高于 2.16.0 的 SDK 会拒绝加载；1.3.10 起只记警告、照常加载。
 
 ## 许可证
 

@@ -266,7 +266,7 @@ def test_unmappable_conversation_is_rejected(adapter, items, message) -> None:
 
 
 def test_default_params_enable_cache_thinking_and_fallback(adapter, settings) -> None:
-    params = adapter.build_message_params(make_request(_tool_round_items()), settings)
+    params = adapter.build_message_params(make_request(_tool_round_items()), settings, official_endpoint=True)
 
     assert params["model"] == "claude-opus-5-5"
     assert params["max_tokens"] == 4096
@@ -301,7 +301,7 @@ def test_history_breakpoint_lands_before_per_request_tail(adapter, settings) -> 
         text_item("UserMessageItem", "回复方向：跟着笑一下"),
     ]
 
-    params = adapter.build_message_params(make_request(items), settings)
+    params = adapter.build_message_params(make_request(items), settings, official_endpoint=True)
 
     assert _block_breakpoints(params) == [(1, 0)]
     assert params["messages"][1]["content"][0] == {
@@ -314,7 +314,7 @@ def test_history_breakpoint_lands_before_per_request_tail(adapter, settings) -> 
 
 
 def test_history_breakpoint_uses_tool_result_when_it_is_the_latest_model_side_block(adapter, settings) -> None:
-    params = adapter.build_message_params(make_request(_tool_round_items()), settings)
+    params = adapter.build_message_params(make_request(_tool_round_items()), settings, official_endpoint=True)
 
     # 最后一块模型侧内容是 call_b 的结果，后面的“继续”是本轮新内容，不打断点
     assert _block_breakpoints(params) == [(2, 1)]
@@ -325,7 +325,7 @@ def test_history_breakpoint_on_last_block_when_request_ends_with_model_side_bloc
     # 工具循环中途的请求以工具结果收尾，整段请求下一步都会原样出现
     items = [*_tool_round_items()[:-1]]
 
-    params = adapter.build_message_params(make_request(items), settings)
+    params = adapter.build_message_params(make_request(items), settings, official_endpoint=True)
 
     assert _block_breakpoints(params) == [(2, 1)]
     assert "cache_control" not in params
@@ -334,7 +334,7 @@ def test_history_breakpoint_on_last_block_when_request_ends_with_model_side_bloc
 def test_no_history_breakpoint_without_model_side_blocks(adapter, settings) -> None:
     items = [text_item("SystemMessageItem", "你是白洲梓"), text_item("UserMessageItem", "在吗")]
 
-    params = adapter.build_message_params(make_request(items), settings)
+    params = adapter.build_message_params(make_request(items), settings, official_endpoint=True)
 
     assert _block_breakpoints(params) == []
     assert "cache_control" not in params
@@ -389,7 +389,7 @@ def test_message_burst_stays_within_cache_lookback(adapter, settings) -> None:
         text_item("UserMessageItem", "当前时间：05:03"),
     ]
 
-    params = adapter.build_message_params(make_request(items), settings)
+    params = adapter.build_message_params(make_request(items), settings, official_endpoint=True)
 
     flat = [block for message in params["messages"] for block in message["content"]]
     previous_anchor = next(i for i, block in enumerate(flat) if block.get("text") == "上一轮回复")
@@ -400,7 +400,7 @@ def test_message_burst_stays_within_cache_lookback(adapter, settings) -> None:
 def test_cache_disabled_leaves_no_breakpoints(adapter, config_models) -> None:
     settings = config_models.ProviderSettings(prompt_cache=False)
 
-    params = adapter.build_message_params(make_request(_tool_round_items()), settings)
+    params = adapter.build_message_params(make_request(_tool_round_items()), settings, official_endpoint=True)
 
     assert "cache_control" not in params
     assert all("cache_control" not in block for block in params["system"])
@@ -410,7 +410,7 @@ def test_cache_disabled_leaves_no_breakpoints(adapter, config_models) -> None:
 def test_one_hour_ttl_applies_to_both_breakpoints(adapter, config_models) -> None:
     settings = config_models.ProviderSettings(cache_ttl="1h")
 
-    params = adapter.build_message_params(make_request(_tool_round_items()), settings)
+    params = adapter.build_message_params(make_request(_tool_round_items()), settings, official_endpoint=True)
 
     assert params["system"][-1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert params["messages"][2]["content"][1]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
@@ -421,7 +421,7 @@ def test_fallback_only_sent_to_supporting_models(adapter, settings, model) -> No
     request = make_request([text_item("UserMessageItem", "hi")])
     request["model_info"]["model_identifier"] = model
 
-    params = adapter.build_message_params(request, settings)
+    params = adapter.build_message_params(request, settings, official_endpoint=True)
 
     assert "fallbacks" not in params
     assert "betas" not in params
@@ -432,7 +432,7 @@ def test_fallback_sent_to_supporting_models(adapter, settings, model) -> None:
     request = make_request([text_item("UserMessageItem", "hi")])
     request["model_info"]["model_identifier"] = model
 
-    params = adapter.build_message_params(request, settings)
+    params = adapter.build_message_params(request, settings, official_endpoint=True)
 
     assert params["fallbacks"] == "default"
     assert params["betas"] == ["server-side-fallback-2026-07-01"]
@@ -441,13 +441,28 @@ def test_fallback_sent_to_supporting_models(adapter, settings, model) -> None:
 def test_fallback_can_be_disabled(adapter, config_models) -> None:
     settings = config_models.ProviderSettings(refusal_fallback=False)
 
-    params = adapter.build_message_params(make_request([text_item("UserMessageItem", "hi")]), settings)
+    params = adapter.build_message_params(
+        make_request([text_item("UserMessageItem", "hi")]), settings, official_endpoint=True
+    )
 
     assert "fallbacks" not in params
 
 
+def test_fallback_not_sent_to_compatible_endpoint(adapter, settings) -> None:
+    # 服务端拒答兜底是官方 API 的能力；第三方端点即使用同名模型 id 也不认识 fallbacks 和对应 beta
+    params = adapter.build_message_params(
+        make_request([text_item("UserMessageItem", "hi")]), settings, official_endpoint=False
+    )
+
+    assert params["model"] == "claude-opus-5-5"
+    assert "fallbacks" not in params
+    assert "betas" not in params
+
+
 def test_temperature_is_forwarded_through_extra_body(adapter, settings) -> None:
-    params = adapter.build_message_params(make_request([text_item("UserMessageItem", "hi")], temperature=0.7), settings)
+    params = adapter.build_message_params(
+        make_request([text_item("UserMessageItem", "hi")], temperature=0.7), settings, official_endpoint=False
+    )
 
     assert params["extra_body"] == {"temperature": 0.7}
 
@@ -458,7 +473,7 @@ def test_json_object_appends_instruction_as_cached_last_system_block(adapter, se
         response_format={"format_type": "json_object"},
     )
 
-    params = adapter.build_message_params(request, settings)
+    params = adapter.build_message_params(request, settings, official_endpoint=True)
 
     assert [block["text"] for block in params["system"]] == ["评分器", adapter.JSON_OBJECT_INSTRUCTION]
     assert "cache_control" not in params["system"][0]
@@ -482,7 +497,7 @@ def test_json_schema_is_transformed_for_structured_outputs(adapter, settings) ->
         },
     )
 
-    params = adapter.build_message_params(request, settings)
+    params = adapter.build_message_params(request, settings, official_endpoint=True)
 
     output_format = params["output_config"]["format"]
     assert output_format["type"] == "json_schema"
@@ -499,7 +514,7 @@ def test_effort_and_thinking_options(adapter, settings) -> None:
         extra_params={"reasoning_effort": "xhigh", "thinking_display": "omitted", "temperature": 1, "max_tokens": 9},
     )
 
-    params = adapter.build_message_params(request, settings)
+    params = adapter.build_message_params(request, settings, official_endpoint=True)
 
     assert params["output_config"] == {"effort": "xhigh"}
     assert params["thinking"] == {"type": "adaptive", "display": "omitted"}
@@ -508,7 +523,7 @@ def test_effort_and_thinking_options(adapter, settings) -> None:
 def test_thinking_omit_sends_no_thinking_param(adapter, settings) -> None:
     request = make_request([text_item("UserMessageItem", "hi")], extra_params={"thinking": "omit"})
 
-    params = adapter.build_message_params(request, settings)
+    params = adapter.build_message_params(request, settings, official_endpoint=True)
 
     assert "thinking" not in params
 
@@ -543,7 +558,7 @@ def test_tools_use_input_schema(adapter, settings) -> None:
         ],
     )
 
-    params = adapter.build_message_params(request, settings)
+    params = adapter.build_message_params(request, settings, official_endpoint=True)
 
     assert params["tools"] == [
         {
@@ -555,7 +570,9 @@ def test_tools_use_input_schema(adapter, settings) -> None:
 
 
 def test_missing_max_tokens_uses_documented_default(adapter, settings) -> None:
-    params = adapter.build_message_params(make_request([text_item("UserMessageItem", "hi")], max_tokens=None), settings)
+    params = adapter.build_message_params(
+        make_request([text_item("UserMessageItem", "hi")], max_tokens=None), settings, official_endpoint=True
+    )
 
     assert params["max_tokens"] == adapter.DEFAULT_MAX_TOKENS
 
@@ -563,4 +580,6 @@ def test_missing_max_tokens_uses_documented_default(adapter, settings) -> None:
 @pytest.mark.parametrize("value", [0, -1, True, "4096"])
 def test_invalid_max_tokens_is_rejected(adapter, settings, value) -> None:
     with pytest.raises(adapter.ClaudeProviderError, match="max_tokens"):
-        adapter.build_message_params(make_request([text_item("UserMessageItem", "hi")], max_tokens=value), settings)
+        adapter.build_message_params(
+            make_request([text_item("UserMessageItem", "hi")], max_tokens=value), settings, official_endpoint=True
+        )

@@ -88,6 +88,9 @@ async def run(model: str) -> int:
         "base_url": "https://api.anthropic.com",
         "api_key": os.environ["ANTHROPIC_API_KEY"],
         "auth_type": "bearer",
+        "auth_header_name": "Authorization",
+        "auth_header_prefix": "Bearer",
+        "auth_query_name": "api_key",
         # 未限定工作区的个人/服务账号 Key 必须带这个头，否则 API 返回 400
         "default_headers": (
             {"anthropic-workspace-id": os.environ["ANTHROPIC_WORKSPACE_ID"]}

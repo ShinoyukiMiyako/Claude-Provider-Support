@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 from urllib.parse import urlsplit
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, omit
 from maibot_sdk import LLMProvider, MaiBotPlugin
 
 from .claude_adapter import (
@@ -18,11 +18,25 @@ from .claude_adapter import (
 )
 from .config_models import ClaudeProviderConfig, ProviderSettings
 
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "2.0.0"
+OFFICIAL_API_HOST = "api.anthropic.com"
+AUTH_TYPES = ("bearer", "header", "query", "none")
 WORKSPACE_HEADER = "anthropic-workspace-id"
 BETA_HEADER = "anthropic-beta"
 HOST_RPC_MARGIN_SECONDS = 1.0
 _WORKSPACE_ID = re.compile(r"wrkspc_[A-Za-z0-9]+")
+# 决定客户端行为的 Provider 字段；任一变化都要换一个客户端
+_CLIENT_FIELDS = (
+    "api_key",
+    "base_url",
+    "auth_type",
+    "auth_header_name",
+    "auth_header_prefix",
+    "auth_query_name",
+    "default_headers",
+    "default_query",
+    "timeout",
+)
 
 
 class ClaudeProviderPlugin(MaiBotPlugin):
@@ -30,7 +44,7 @@ class ClaudeProviderPlugin(MaiBotPlugin):
 
     def __init__(self) -> None:
         super().__init__()
-        self._clients: dict[tuple[str, ...], AsyncAnthropic] = {}
+        self._clients: dict[str, AsyncAnthropic] = {}
 
     async def on_load(self) -> None:
         self._get_logger().info("Claude Provider 已加载，client_type=%s", CLIENT_TYPE)
@@ -48,7 +62,7 @@ class ClaudeProviderPlugin(MaiBotPlugin):
     @LLMProvider(
         CLIENT_TYPE,
         name="Claude Messages API",
-        description="通过官方 anthropic SDK 调用 Claude Messages API。",
+        description="通过官方 anthropic SDK 调用 Claude Messages API 或兼容该协议的端点。",
         version=PLUGIN_VERSION,
     )
     async def handle_llm_request(self, *, operation: str, request: dict[str, Any]) -> dict[str, Any]:
@@ -58,7 +72,8 @@ class ClaudeProviderPlugin(MaiBotPlugin):
         provider = request.get("api_provider")
         if not isinstance(provider, Mapping):
             raise ClaudeProviderError("请求缺少 api_provider 配置快照")
-        params = build_message_params(request, self._settings)
+        official = urlsplit(_validate_base_url(provider.get("base_url"))).hostname == OFFICIAL_API_HOST
+        params = build_message_params(request, self._settings, official_endpoint=official)
         if "betas" in params:
             params["betas"] = _merge_configured_betas(provider.get("default_headers"), params["betas"])
         client = self._get_client(provider)
@@ -92,25 +107,15 @@ class ClaudeProviderPlugin(MaiBotPlugin):
         return cast(ClaudeProviderConfig, self.config).plugin
 
     def _get_client(self, provider: Mapping[str, Any]) -> AsyncAnthropic:
-        auth_type = provider.get("auth_type")
-        if auth_type != "bearer":
-            raise ClaudeProviderError(
-                f"Claude 官方 API 固定使用 x-api-key 鉴权，auth_type 请保持默认值 bearer，实际为 {auth_type!r}"
-            )
-        api_key = provider.get("api_key")
-        if not isinstance(api_key, str) or not api_key:
-            raise ClaudeProviderError("api_provider.api_key 为空，请在模型配置的 Provider 里填写 Claude API Key")
         base_url = _validate_base_url(provider.get("base_url"))
-        headers = _validate_headers(provider.get("default_headers"))
-        query = dict(provider.get("default_query") or {})
+        api_key, auth_headers, auth_query = _resolve_auth(provider)
+        # 与 MaiBot 内置客户端一致：鉴权生成的头和查询参数覆盖 Provider 里同名的配置
+        headers = {**_validate_headers(provider.get("default_headers")), **auth_headers}
+        query = {**dict(provider.get("default_query") or {}), **auth_query}
         timeout = float(provider["timeout"])
 
-        signature = (
-            api_key,
-            base_url,
-            json.dumps(headers, sort_keys=True, ensure_ascii=False),
-            json.dumps(query, sort_keys=True, ensure_ascii=False),
-            str(timeout),
+        signature = json.dumps(
+            {field: provider.get(field) for field in _CLIENT_FIELDS}, sort_keys=True, ensure_ascii=False
         )
         client = self._clients.get(signature)
         if client is None:
@@ -138,6 +143,46 @@ def _validate_base_url(raw_base_url: Any) -> str:
         # SDK 会自己拼上 /v1/messages，带着 /v1 会请求到 /v1/v1/messages
         raise ClaudeProviderError(f"api_provider.base_url 不要带 /v1，请改为 {base_url[: -len('/v1')]}")
     return base_url
+
+
+def _resolve_auth(provider: Mapping[str, Any]) -> tuple[str, dict[str, Any], dict[str, str]]:
+    """按 Provider 的 auth_type 返回 (交给 SDK 的 api_key, 鉴权请求头, 鉴权查询参数)。
+
+    语义与 MaiBot 内置 OpenAI 兼容客户端相同，同一个 Provider 改成 claude 客户端后鉴权方式不变。
+    """
+
+    auth_type = provider.get("auth_type")
+    if auth_type not in AUTH_TYPES:
+        raise ClaudeProviderError(f"auth_type 只能是 {' / '.join(AUTH_TYPES)} 之一，实际为 {auth_type!r}")
+    # 除默认的 Authorization: Bearer 外都不让 SDK 生成凭据头。SDK 没拿到显式凭据时会去读 ANTHROPIC_API_KEY
+    # 等环境变量和本机 profile，会把宿主上的 Key 发给第三方端点，所以传空串占位，再去掉它据此生成的头
+    if auth_type == "none":
+        return "", {"Authorization": omit}, {}
+    api_key = provider.get("api_key")
+    if not isinstance(api_key, str) or not api_key:
+        raise ClaudeProviderError(
+            "api_provider.api_key 为空，请在模型配置的 Provider 里填写 API Key；端点不需要鉴权时把 auth_type 设为 none"
+        )
+    if auth_type == "query":
+        return "", {"Authorization": omit}, {_require_provider_text(provider, "auth_query_name"): api_key}
+
+    header_name = _require_provider_text(provider, "auth_header_name")
+    prefix = provider.get("auth_header_prefix")
+    if not isinstance(prefix, str):
+        raise ClaudeProviderError(f"api_provider.auth_header_prefix 必须是字符串，实际为 {prefix!r}")
+    if auth_type == "bearer" and header_name == "Authorization" and prefix.strip() == "Bearer":
+        return api_key, {}, {}
+    value = f"{prefix.strip()} {api_key}" if prefix.strip() else api_key
+    if header_name.lower() == "authorization":
+        return "", {header_name: value}, {}
+    return "", {"Authorization": omit, header_name: value}, {}
+
+
+def _require_provider_text(provider: Mapping[str, Any], key: str) -> str:
+    value = provider.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ClaudeProviderError(f"auth_type={provider.get('auth_type')!r} 时 api_provider.{key} 不能为空")
+    return value.strip()
 
 
 def _validate_headers(raw_headers: Any) -> dict[str, Any]:

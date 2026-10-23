@@ -151,7 +151,7 @@ def test_host_loader_loads_plugin_and_registers_provider(host: SimpleNamespace, 
 def test_host_snapshot_maps_to_claude_params(host: SimpleNamespace, adapter: Any, settings: Any) -> None:
     snapshot = host.serialize_response_request_snapshot(_build_request(host))
 
-    params = adapter.build_message_params(snapshot, settings)
+    params = adapter.build_message_params(snapshot, settings, official_endpoint=True)
 
     assert params["system"][0]["text"] == "你是麦麦"
     assert [message["role"] for message in params["messages"]] == ["user", "assistant", "user"]

@@ -20,7 +20,7 @@ ITEM_SCHEMA_VERSION = 1
 # MaiBot 任务总会给出 max_tokens；只有调用方显式传 None 时才用这个值，因为 Messages API 要求必填
 DEFAULT_MAX_TOKENS = 16000
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
-# 只有这些模型在 Claude API 上接受 fallbacks="default"；对其他模型发送该参数会被拒绝或不起作用
+# 只有这些模型在官方 Claude API 上接受 fallbacks="default"；对其他模型发送该参数会被拒绝或不起作用
 SERVER_FALLBACK_MODELS = frozenset(
     {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-sonnet-5-5"}
 )
@@ -61,8 +61,13 @@ class ModelOptions:
     thinking_display: str | None
 
 
-def build_message_params(request: Mapping[str, Any], settings: ProviderSettings) -> dict[str, Any]:
-    """把 MaiBot 的 response 请求快照转换为 ``client.beta.messages.stream`` 的关键字参数。"""
+def build_message_params(
+    request: Mapping[str, Any], settings: ProviderSettings, *, official_endpoint: bool
+) -> dict[str, Any]:
+    """把 MaiBot 的 response 请求快照转换为 ``client.beta.messages.stream`` 的关键字参数。
+
+    ``official_endpoint`` 表示请求发往官方 Claude API；兼容该协议的第三方端点不认识服务端拒答兜底。
+    """
 
     model_info = _require_mapping(request.get("model_info"), "model_info")
     model = _require_text(model_info.get("model_identifier"), "model_info.model_identifier")
@@ -106,9 +111,10 @@ def build_message_params(request: Mapping[str, Any], settings: ProviderSettings)
         _mark_shared_prefix_end(messages, cache_control)
     temperature = request.get("temperature")
     if temperature is not None:
-        # anthropic 1.x 去掉了 temperature 形参；仍接受它的旧模型只能经 extra_body 传入
+        # anthropic SDK 已去掉 temperature 形参，官方 API 自 2026-10-21 版起对任何模型都返回 400；
+        # 兼容端点多数仍接受，开着 send_temperature 就经 extra_body 原样发出，由端点决定
         params["extra_body"] = {"temperature": temperature}
-    if settings.refusal_fallback and model in SERVER_FALLBACK_MODELS:
+    if settings.refusal_fallback and official_endpoint and model in SERVER_FALLBACK_MODELS:
         params["fallbacks"] = "default"
         params["betas"] = [FALLBACK_BETA]
     return params

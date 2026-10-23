@@ -102,6 +102,28 @@ def text_item(item_type: str, text: str) -> dict[str, Any]:
     return {"item_type": item_type, "meta": meta(), "parts": [{"type": "text", "text": text}]}
 
 
+def make_provider(**overrides: Any) -> dict[str, Any]:
+    """MaiBot 传给插件的 api_provider 快照，字段与 APIProvider.model_dump 一致，取宿主默认值。"""
+
+    provider: dict[str, Any] = {
+        "name": "Claude",
+        "base_url": "https://api.anthropic.com",
+        "api_key": "sk-ant-test-placeholder",
+        "client_type": "claude",
+        "auth_type": "bearer",
+        "auth_header_name": "Authorization",
+        "auth_header_prefix": "Bearer",
+        "auth_query_name": "api_key",
+        "default_headers": {},
+        "default_query": {},
+        "max_retry": 3,
+        "timeout": 120,
+        "retry_interval": 4,
+    }
+    provider.update(overrides)
+    return provider
+
+
 def make_request(context_items: list[dict[str, Any]], **overrides: Any) -> dict[str, Any]:
     request: dict[str, Any] = {
         "item_schema_version": 1,

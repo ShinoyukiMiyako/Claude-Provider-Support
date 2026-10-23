@@ -8,7 +8,9 @@ from typing import Any
 import httpx2
 import pytest
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
-from support import make_request, text_item
+from support import make_provider, make_request, text_item
+
+HOST_SECRET = "sk-ant-host-env-secret"
 
 _SSE_EVENTS: list[dict[str, Any]] = [
     {
@@ -87,12 +89,15 @@ async def test_real_sdk_wire_request_and_stream_parsing(plugin) -> None:
         temperature=0.5,
         extra_params={"effort": "high"},
     )
-    request["api_provider"] = {"timeout": 30}
+    request["api_provider"] = make_provider(timeout=30)
 
     result = await plugin.handle_llm_request(operation="response", request=request)
 
     assert captured["url"].startswith("https://api.anthropic.com/v1/messages")
-    assert captured["headers"]["x-api-key"] == "sk-ant-test-placeholder"
+    # anthropic 2.x 默认走 API 版本 2026-10-21，Key 改放在 Authorization: Bearer
+    assert captured["headers"]["anthropic-version"] == "2026-10-21"
+    assert captured["headers"]["authorization"] == "Bearer sk-ant-test-placeholder"
+    assert "x-api-key" not in captured["headers"]
     assert "server-side-fallback-2026-07-01" in captured["headers"]["anthropic-beta"]
     body = captured["body"]
     assert body["stream"] is True
@@ -138,14 +143,9 @@ async def test_workspace_header_from_provider_reaches_the_wire(plugin, plugin_mo
 
     monkeypatch.setattr(plugin_module, "AsyncAnthropic", client_with_mock_transport)
     request = make_request([text_item("UserMessageItem", "hi")])
-    request["api_provider"] = {
-        "base_url": "https://api.anthropic.com",
-        "api_key": "sk-ant-test-placeholder",
-        "auth_type": "bearer",
-        "default_headers": {"anthropic-workspace-id": "wrkspc_01ExampleWorkspaceId0000"},
-        "default_query": {},
-        "timeout": 30,
-    }
+    request["api_provider"] = make_provider(
+        default_headers={"anthropic-workspace-id": "wrkspc_01ExampleWorkspaceId0000"}, timeout=30
+    )
 
     await plugin.handle_llm_request(operation="response", request=request)
 
@@ -168,17 +168,99 @@ async def test_configured_beta_header_survives_fallback_betas(plugin, plugin_mod
 
     monkeypatch.setattr(plugin_module, "AsyncAnthropic", client_with_mock_transport)
     request = make_request([text_item("UserMessageItem", "hi")])
-    request["api_provider"] = {
-        "base_url": "https://api.anthropic.com",
-        "api_key": "sk-ant-test-placeholder",
-        "auth_type": "bearer",
-        "default_headers": {"anthropic-beta": "context-1m-2025-08-07, files-api-2025-04-14"},
-        "default_query": {},
-        "timeout": 30,
-    }
+    request["api_provider"] = make_provider(
+        default_headers={"anthropic-beta": "context-1m-2025-08-07, files-api-2025-04-14"}, timeout=30
+    )
 
     await plugin.handle_llm_request(operation="response", request=request)
 
     sent = [beta.strip() for beta in captured["headers"]["anthropic-beta"].split(",")]
     assert sent == ["context-1m-2025-08-07", "files-api-2025-04-14", "server-side-fallback-2026-07-01"]
+    await plugin.on_unload()
+
+
+@pytest.mark.parametrize(
+    ("auth", "expected_headers", "expected_query"),
+    [
+        ({}, {"authorization": "Bearer sk-relay-key"}, {}),
+        (
+            {"auth_type": "header", "auth_header_name": "x-api-key", "auth_header_prefix": ""},
+            {"x-api-key": "sk-relay-key"},
+            {},
+        ),
+        (
+            {"auth_type": "header", "auth_header_name": "Authorization", "auth_header_prefix": "Token"},
+            {"authorization": "Token sk-relay-key"},
+            {},
+        ),
+        ({"auth_type": "bearer", "auth_header_name": "api-key"}, {"api-key": "Bearer sk-relay-key"}, {}),
+        ({"auth_type": "query", "auth_query_name": "key"}, {}, {"key": "sk-relay-key"}),
+        ({"auth_type": "none", "api_key": ""}, {}, {}),
+    ],
+    ids=["bearer", "x-api-key", "custom-prefix", "custom-bearer-header", "query", "none"],
+)
+async def test_compatible_endpoint_auth_follows_provider_settings(
+    plugin, plugin_module, monkeypatch, auth, expected_headers, expected_query
+) -> None:
+    # 宿主环境里的 ANTHROPIC_API_KEY 只属于本机，任何鉴权方式都不能让 SDK 把它带给第三方端点
+    monkeypatch.setenv("ANTHROPIC_API_KEY", HOST_SECRET)
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["url"] = request.url
+        captured["headers"] = dict(request.headers)
+        captured["body"] = json.loads(request.content)
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=_sse_body())
+
+    real_client = plugin_module.AsyncAnthropic
+
+    def client_with_mock_transport(**kwargs: Any) -> AsyncAnthropic:
+        return real_client(**kwargs, http_client=DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)))
+
+    monkeypatch.setattr(plugin_module, "AsyncAnthropic", client_with_mock_transport)
+    request = make_request([text_item("UserMessageItem", "hi")])
+    request["api_provider"] = make_provider(
+        **{"base_url": "https://relay.example.com/anthropic", "api_key": "sk-relay-key", "timeout": 30, **auth}
+    )
+
+    await plugin.handle_llm_request(operation="response", request=request)
+
+    url = captured["url"]
+    assert f"{url.scheme}://{url.host}{url.path}" == "https://relay.example.com/anthropic/v1/messages"
+    query = dict(url.params)
+    query.pop("beta")
+    assert query == expected_query
+    credential_headers = {
+        name: value for name, value in captured["headers"].items() if name in {"authorization", "x-api-key", "api-key"}
+    }
+    assert credential_headers == expected_headers
+    assert all(HOST_SECRET not in value for value in captured["headers"].values())
+    # 兼容端点不认识服务端拒答兜底，同名模型也不发
+    assert "fallbacks" not in captured["body"]
+    assert "anthropic-beta" not in captured["headers"]
+    await plugin.on_unload()
+
+
+async def test_api_version_can_be_pinned_per_provider(plugin, plugin_module, monkeypatch) -> None:
+    # 只认旧版本号的兼容端点可在 Provider 的 default_headers 里写回 2023-06-01
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        captured["headers"] = dict(request.headers)
+        return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=_sse_body())
+
+    real_client = plugin_module.AsyncAnthropic
+
+    def client_with_mock_transport(**kwargs: Any) -> AsyncAnthropic:
+        return real_client(**kwargs, http_client=DefaultAsyncHttpxClient(transport=httpx2.MockTransport(handler)))
+
+    monkeypatch.setattr(plugin_module, "AsyncAnthropic", client_with_mock_transport)
+    request = make_request([text_item("UserMessageItem", "hi")])
+    request["api_provider"] = make_provider(
+        base_url="https://relay.example.com", default_headers={"anthropic-version": "2023-06-01"}, timeout=30
+    )
+
+    await plugin.handle_llm_request(operation="response", request=request)
+
+    assert captured["headers"]["anthropic-version"] == "2023-06-01"
     await plugin.on_unload()

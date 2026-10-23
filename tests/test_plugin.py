@@ -2,30 +2,9 @@ from __future__ import annotations
 
 import json
 import tomllib
-from typing import Any
 
 import pytest
-from support import PLUGIN_DIR, FakeClient, FakeStream, make_message, make_request, text_item
-
-
-def _provider(**overrides: Any) -> dict[str, Any]:
-    provider: dict[str, Any] = {
-        "name": "Claude",
-        "base_url": "https://api.anthropic.com",
-        "api_key": "sk-ant-test-placeholder",
-        "client_type": "claude",
-        "auth_type": "bearer",
-        "auth_header_name": "Authorization",
-        "auth_header_prefix": "Bearer",
-        "auth_query_name": "api_key",
-        "default_headers": {},
-        "default_query": {},
-        "max_retry": 3,
-        "timeout": 120,
-        "retry_interval": 4,
-    }
-    provider.update(overrides)
-    return provider
+from support import PLUGIN_DIR, FakeClient, FakeStream, make_message, make_provider, make_request, text_item
 
 
 @pytest.fixture
@@ -39,7 +18,7 @@ async def test_handler_sends_mapped_params_and_returns_items(plugin) -> None:
     fake = FakeClient(FakeStream(make_message([{"type": "text", "text": "喵"}])))
     plugin._get_client = lambda provider: fake
     request = make_request([text_item("SystemMessageItem", "你是猫"), text_item("UserMessageItem", "叫一声")])
-    request["api_provider"] = _provider()
+    request["api_provider"] = make_provider()
 
     result = await plugin.handle_llm_request(operation="response", request=request)
 
@@ -54,7 +33,7 @@ async def test_total_timeout_aborts_stream(plugin, adapter) -> None:
     stream = FakeStream(make_message([{"type": "text", "text": "迟到"}]), delay=1.0)
     plugin._get_client = lambda provider: FakeClient(stream)
     request = make_request([text_item("UserMessageItem", "hi")])
-    request["api_provider"] = _provider(timeout=0.05)
+    request["api_provider"] = make_provider(timeout=0.05)
 
     with pytest.raises(adapter.ClaudeProviderError, match="0.05s"):
         await plugin.handle_llm_request(operation="response", request=request)
@@ -67,7 +46,7 @@ async def test_total_timeout_fires_before_host_rpc_deadline(plugin, adapter) -> 
     stream = FakeStream(make_message([{"type": "text", "text": "迟到"}]), delay=0.3)
     plugin._get_client = lambda provider: FakeClient(stream)
     request = make_request([text_item("UserMessageItem", "hi")])
-    request["api_provider"] = _provider(timeout=0.4)
+    request["api_provider"] = make_provider(timeout=0.4)
 
     with pytest.raises(adapter.ClaudeProviderError, match="0.4s"):
         await plugin.handle_llm_request(operation="response", request=request)
@@ -80,9 +59,9 @@ async def test_non_chat_operations_are_rejected(plugin, adapter, operation) -> N
 
 
 async def test_clients_are_reused_per_provider_and_closed_on_unload(plugin) -> None:
-    first = plugin._get_client(_provider())
-    same = plugin._get_client(_provider())
-    other = plugin._get_client(_provider(api_key="sk-ant-other-placeholder"))
+    first = plugin._get_client(make_provider())
+    same = plugin._get_client(make_provider())
+    other = plugin._get_client(make_provider(api_key="sk-ant-other-placeholder"))
 
     assert first is same
     assert other is not first
@@ -100,7 +79,9 @@ async def test_clients_are_reused_per_provider_and_closed_on_unload(plugin) -> N
         ({"base_url": "https://api.anthropic.com/v1"}, "不要带 /v1"),
         ({"base_url": "api.anthropic.com"}, "http"),
         ({"base_url": ""}, "base_url 为空"),
-        ({"auth_type": "header"}, "x-api-key"),
+        ({"auth_type": "x-api-key"}, "auth_type"),
+        ({"auth_type": "header", "auth_header_name": " "}, "auth_header_name"),
+        ({"auth_type": "query", "auth_query_name": ""}, "auth_query_name"),
         ({"api_key": ""}, "api_key 为空"),
         ({"default_headers": {"anthropic-workspace-id": " wrkspc_01ExampleWorkspaceId0000"}}, "wrkspc_"),
         ({"default_headers": {"Anthropic-Workspace-Id": "Default"}}, "Anthropic-Workspace-Id"),
@@ -109,7 +90,20 @@ async def test_clients_are_reused_per_provider_and_closed_on_unload(plugin) -> N
 )
 def test_invalid_provider_config_is_rejected(plugin, adapter, overrides, message) -> None:
     with pytest.raises(adapter.ClaudeProviderError, match=message):
-        plugin._get_client(_provider(**overrides))
+        plugin._get_client(make_provider(**overrides))
+
+
+def test_keyless_endpoint_is_accepted_with_auth_type_none(plugin) -> None:
+    client = plugin._get_client(make_provider(auth_type="none", api_key=""))
+
+    assert str(client.base_url).rstrip("/") == "https://api.anthropic.com"
+
+
+def test_clients_differ_by_auth_settings(plugin) -> None:
+    bearer = plugin._get_client(make_provider())
+    header = plugin._get_client(make_provider(auth_type="header", auth_header_name="x-api-key", auth_header_prefix=""))
+
+    assert bearer is not header
 
 
 def test_manifest_code_and_pyproject_agree(plugin, plugin_module) -> None:
@@ -120,5 +114,10 @@ def test_manifest_code_and_pyproject_agree(plugin, plugin_module) -> None:
     registered = [provider["client_type"] for provider in plugin.get_llm_providers()]
     assert declared == registered == ["claude"]
     assert manifest["version"] == plugin_module.PLUGIN_VERSION == pyproject["project"]["version"]
-    manifest_anthropic = next(dep for dep in manifest["dependencies"] if dep["name"] == "anthropic")
-    assert f"anthropic{manifest_anthropic['version_spec']}" in pyproject["project"]["dependencies"]
+    assert manifest["llm_providers"][0]["version"] == plugin_module.PLUGIN_VERSION
+    # 运行时依赖两边逐条一致；maibot-plugin-sdk 由宿主提供，只出现在开发依赖和 manifest 的 sdk 范围里
+    assert [f"{dep['name']}{dep['version_spec']}" for dep in manifest["dependencies"]] == pyproject["project"][
+        "dependencies"
+    ]
+    sdk = manifest["sdk"]
+    assert f"maibot-plugin-sdk>={sdk['min_version']},<3.0.0" in pyproject["dependency-groups"]["dev"]
